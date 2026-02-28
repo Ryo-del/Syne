@@ -7,9 +7,8 @@ import (
 
 // UDPTransport is a base point for direct UDP packet exchange.
 type Peer struct {
-	ID        string
-	PublicKey []byte
-	Addr      *net.UDPAddr
+	PeerID string
+	Addr   *net.UDPAddr
 }
 
 func ListenUDP(port int) (*net.UDPConn, error) {
@@ -27,9 +26,6 @@ func SendUDP(conn *net.UDPConn, peer *Peer, data []byte) error {
 	if peer == nil || peer.Addr == nil {
 		return fmt.Errorf("peer address is nil")
 	}
-	if string(data) == "Ping" {
-		data = []byte("Pong")
-	}
 	_, err := conn.WriteToUDP(data, peer.Addr)
 	return err
 }
@@ -41,4 +37,15 @@ func ReceptionUDP(conn *net.UDPConn) ([]byte, *net.UDPAddr, error) {
 		return nil, nil, err
 	}
 	return buf[:n], sender, nil
+}
+
+func IsPortFree(port int) bool {
+	conn, err := net.ListenUDP("udp6", &net.UDPAddr{
+		Port: port,
+	})
+	if err != nil {
+		return false
+	}
+	conn.Close()
+	return true
 }

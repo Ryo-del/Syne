@@ -1,7 +1,7 @@
 package messaging
 
 import (
-	transform "Sync/core/transport"
+	transform "Syne/core/transport"
 	"fmt"
 	"net"
 )

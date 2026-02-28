@@ -1,8 +1,32 @@
 package protocol
 
-// Message is a base protocol envelope for core communication.
+type MessageType uint8
+
+const (
+	MsgJoin MessageType = iota
+	MsgLeave
+	MsgChat
+	MsgDiscovery
+	MsgPing
+	MsgPong
+)
+
+type TargetType uint8
+
+const (
+	TargetPeer TargetType = iota + 1
+	TargetGroup
+	TargetBroadcast
+)
+
 type Message struct {
-	ID      string
-	Version string
-	Type    string
+	Version  uint8
+	Type     MessageType
+	Target   TargetType
+	TargetID string
+	ChatID   string
+	From     string
+	Payload  []byte
+
+	Timestamp int64
 }
