@@ -1,16 +1,21 @@
 package history
 
 import (
+	"Syne/core/protocol"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"os"
-	"time"
+	"path/filepath"
+	"syscall"
 )
 
 type StoredMessage struct {
 	Version   uint8  `json:"version"`
 	Type      uint8  `json:"type"`
 	Target    uint8  `json:"target"`
+	MessageID string `json:"message_id,omitempty"`
 	TargetID  string `json:"target_id"`
 	ChatID    string `json:"chat_id"`
 	From      string `json:"from"`
@@ -18,22 +23,44 @@ type StoredMessage struct {
 	Timestamp int64  `json:"timestamp"`
 }
 
-func SaveMessage(chatID string, msg []byte, version uint8, msgType uint8, target uint8, targetID string, from string) error {
-	file, err := os.OpenFile(chatID+".json", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+func SaveMessage(msg protocol.Message) error {
+	path, err := historyFilePath(msg.ChatID)
+	if err != nil {
+		return err
+	}
+
+	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o644)
 	if err != nil {
 		return err
 	}
 	defer file.Close()
 
+	// Cross-process lock: check+append must be atomic for local multi-process chat runs.
+	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX); err != nil {
+		return err
+	}
+	defer func() { _ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN) }()
+
 	stored := StoredMessage{
-		Version:   version,
-		Type:      msgType,
-		Target:    target,
-		TargetID:  targetID,
-		ChatID:    chatID,
-		From:      from,
-		Payload:   msg,
-		Timestamp: time.Now().UnixMilli(),
+		Version:   msg.Version,
+		Type:      uint8(msg.Type),
+		Target:    uint8(msg.Target),
+		MessageID: msg.MessageID,
+		TargetID:  msg.TargetID,
+		ChatID:    msg.ChatID,
+		From:      msg.From,
+		Payload:   msg.Payload,
+		Timestamp: msg.Timestamp,
+	}
+
+	if stored.MessageID != "" {
+		exists, err := hasMessageIDInFile(file, stored.MessageID)
+		if err != nil {
+			return err
+		}
+		if exists {
+			return nil
+		}
 	}
 
 	data, err := json.Marshal(stored)
@@ -41,14 +68,20 @@ func SaveMessage(chatID string, msg []byte, version uint8, msgType uint8, target
 		return err
 	}
 
-	if _, err := file.Write(append(data, []byte("\n")...)); err != nil {
+	if _, err := file.Seek(0, io.SeekEnd); err != nil {
 		return err
 	}
-	return nil
+	_, err = file.Write(append(data, '\n'))
+	return err
 }
 
 func LoadMessages(chatID string) ([]StoredMessage, error) {
-	file, err := os.Open(chatID + ".json")
+	path, err := historyFilePath(chatID)
+	if err != nil {
+		return nil, err
+	}
+
+	file, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return []StoredMessage{}, nil
@@ -59,7 +92,6 @@ func LoadMessages(chatID string) ([]StoredMessage, error) {
 
 	var messages []StoredMessage
 	decoder := json.NewDecoder(file)
-
 	for {
 		var stored StoredMessage
 		if err := decoder.Decode(&stored); err != nil {
@@ -70,6 +102,35 @@ func LoadMessages(chatID string) ([]StoredMessage, error) {
 		}
 		messages = append(messages, stored)
 	}
-
 	return messages, nil
+}
+
+func historyFilePath(chatID string) (string, error) {
+	historyDir := filepath.Join("data", "history")
+	if err := os.MkdirAll(historyDir, 0o755); err != nil {
+		return "", err
+	}
+
+	sum := sha256.Sum256([]byte(chatID))
+	safeName := hex.EncodeToString(sum[:])
+	return filepath.Join(historyDir, safeName+".jsonl"), nil
+}
+
+func hasMessageIDInFile(file *os.File, messageID string) (bool, error) {
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return false, err
+	}
+	decoder := json.NewDecoder(file)
+	for {
+		var stored StoredMessage
+		if err := decoder.Decode(&stored); err != nil {
+			if err == io.EOF {
+				return false, nil
+			}
+			return false, err
+		}
+		if stored.MessageID != "" && stored.MessageID == messageID {
+			return true, nil
+		}
+	}
 }

@@ -32,6 +32,7 @@ type Message struct {
 	Type    MessageType `json:"type"`
 	Target  TargetType  `json:"target"`
 
+	MessageID string `json:"message_id,omitempty"`
 	TargetID string `json:"target_id"`
 	ChatID   string `json:"chat_id"`
 	From     string `json:"from"`

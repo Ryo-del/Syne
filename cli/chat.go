@@ -14,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // Config contains minimal settings for local P2P chat testing.
@@ -106,12 +108,11 @@ func RunChat(ctx context.Context, cfg Config) error {
 				if err := sendProtocolMessage(peer, ack); err != nil {
 					fmt.Printf("join ack send error: %v\n", err)
 				}
-
 			case protocol.MsgJoinAck:
 				fmt.Printf("\n[system] %s acknowledged join for %s\n> ", msg.From, msg.ChatID)
 			case protocol.MsgChat:
 				fmt.Printf("\n<- %s [%s]: %s\n> ", msg.From, msg.ChatID, string(msg.Payload))
-				if err := history.SaveMessage(msg.ChatID, msg.Payload, msg.Version, uint8(msg.Type), uint8(msg.Target), msg.TargetID, msg.From); err != nil {
+				if err := history.SaveMessage(msg); err != nil {
 					fmt.Printf("history save (incoming) error: %v\n", err)
 				}
 			default:
@@ -149,6 +150,7 @@ func RunChat(ctx context.Context, cfg Config) error {
 			Version:   protocol.ProtocolVersion,
 			Type:      protocol.MsgChat,
 			Target:    protocol.TargetPeer,
+			MessageID: uuid.NewString(),
 			TargetID:  cfg.PeerID,
 			ChatID:    chatID,
 			From:      cfg.LocalID,
@@ -160,7 +162,7 @@ func RunChat(ctx context.Context, cfg Config) error {
 			fmt.Printf("send error: %v\n", err)
 			continue
 		}
-		if err := history.SaveMessage(out.ChatID, out.Payload, out.Version, uint8(out.Type), uint8(out.Target), out.TargetID, out.From); err != nil {
+		if err := history.SaveMessage(out); err != nil {
 			fmt.Printf("history save (outgoing) error: %v\n", err)
 		}
 	}
