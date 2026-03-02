@@ -5,10 +5,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
-	"syscall"
+	"time"
 )
 
 type StoredMessage struct {
@@ -35,11 +36,11 @@ func SaveMessage(msg protocol.Message) error {
 	}
 	defer file.Close()
 
-	// Cross-process lock: check+append must be atomic for local multi-process chat runs.
-	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX); err != nil {
+	unlock, err := acquireFileLock(path + ".lock")
+	if err != nil {
 		return err
 	}
-	defer func() { _ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN) }()
+	defer unlock()
 
 	stored := StoredMessage{
 		Version:   msg.Version,
@@ -132,5 +133,31 @@ func hasMessageIDInFile(file *os.File, messageID string) (bool, error) {
 		if stored.MessageID != "" && stored.MessageID == messageID {
 			return true, nil
 		}
+	}
+}
+
+func acquireFileLock(lockPath string) (func(), error) {
+	const (
+		waitStep = 20 * time.Millisecond
+		timeout  = 3 * time.Second
+	)
+
+	deadline := time.Now().Add(timeout)
+	for {
+		lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if err == nil {
+			return func() {
+				_ = lockFile.Close()
+				_ = os.Remove(lockPath)
+			}, nil
+		}
+
+		if !os.IsExist(err) {
+			return nil, err
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("timeout acquiring history lock: %s", lockPath)
+		}
+		time.Sleep(waitStep)
 	}
 }
