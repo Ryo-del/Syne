@@ -1,53 +1,57 @@
 package messaging
 
 import (
-	transform "Syne/core/transport"
+	"Syne/core/protocol"
+	"Syne/core/transport"
 	"fmt"
 	"net"
+	"sync"
 )
 
 // Messenger coordinates outgoing/incoming message flow.
 type Messenger struct {
-	Conn  *net.UDPConn
-	Peers map[string]*transform.Peer
-	Inbox chan Messege
-}
-type Messege struct {
-	From    string
-	Content []byte
+	Peers     map[string]*transport.Peer
+	addrIndex map[string]string
+	mu        sync.RWMutex
+	Inbox     chan protocol.Message
 }
 
-func NewMessenger(conn *net.UDPConn, peers map[string]*transform.Peer, bufSize int) *Messenger {
+func NewMessenger(peers map[string]*transport.Peer, bufSize int) *Messenger {
+	addrIndex := make(map[string]string, len(peers))
+	for id, peer := range peers {
+		if peer == nil || peer.Addr == nil {
+			continue
+		}
+		addrIndex[peer.Addr.String()] = id
+	}
+
 	return &Messenger{
-		Conn:  conn,
-		Peers: peers,
-		Inbox: make(chan Messege, bufSize),
+		Peers:     peers,
+		addrIndex: addrIndex,
+		Inbox:     make(chan protocol.Message, bufSize),
 	}
 }
-func (m *Messenger) SendMessage(connID string, data []byte) error {
-	peer, ok := m.Peers[connID]
+
+func (m *Messenger) RegisterPeer(peerID string, peer *transport.Peer) {
+	if peer == nil || peer.Addr == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.Peers[peerID] = peer
+	m.addrIndex[peer.Addr.String()] = peerID
+}
+
+func (m *Messenger) ResolvePeerIDByAddr(addr *net.TCPAddr) (string, error) {
+	if addr == nil {
+		return "", fmt.Errorf("sender address is nil")
+	}
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	id, ok := m.addrIndex[addr.String()]
 	if !ok {
-		return fmt.Errorf("peer not found: %s", connID)
+		return "", fmt.Errorf("peer not found for address: %s", addr.String())
 	}
-	return transform.SendUDP(m.Conn, peer, data)
-}
-
-func (m *Messenger) ReceiveLoop() {
-
-	for {
-		data, sender, err := transform.ReceptionUDP(m.Conn)
-		if err != nil {
-			fmt.Printf("Error receiving message: %v\n", err)
-			return
-		}
-		for id, peer := range m.Peers {
-			if peer.Addr == nil {
-				continue
-			}
-			if peer.Addr.String() == sender.String() {
-				m.Inbox <- Messege{From: id, Content: data}
-				break
-			}
-		}
-	}
+	return id, nil
 }

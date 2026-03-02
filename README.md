@@ -21,7 +21,7 @@ React → Tauri → Go Core
 Go (net/http для MVP)
 core/
  ├── transport/       # низкоуровневый обмен пакетами
- │    ├── udp.go      # базовый UDP транспорт
+ │    ├── tcp.go      # базовый UDP транспорт
  │    └── relay.go    # (опционально) relay соединения
  ├── discovery/       # поиск пиров в сети
  │    └── lan.go      # локальный поиск через UDP multicast
