@@ -20,7 +20,31 @@ type Contact struct {
 func (c Contact) Address() string {
 	return net.JoinHostPort(c.IP, c.Port)
 }
+func RenameContact(old_Name, new_Name string) error {
+	old_Name = strings.TrimSpace(old_Name)
+	new_Name = strings.TrimSpace(new_Name)
+	if old_Name == "" || new_Name == "" {
+		return fmt.Errorf("old-name and new-name are required")
+	}
 
+	contacts, err := ListContacts()
+	if err != nil {
+		return err
+	}
+	found := false
+	for i := range contacts {
+		if contacts[i].Name == old_Name {
+			contacts[i].Name = new_Name
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		return fmt.Errorf("contact with name %s not found", old_Name)
+	}
+	return writeContacts(contacts)
+}
 func AddContact(c Contact) error {
 	c.Name = strings.TrimSpace(c.Name)
 	c.PeerID = strings.TrimSpace(c.PeerID)
@@ -58,11 +82,29 @@ func ListContacts() ([]Contact, error) {
 		return nil, err
 	}
 
-	file, err := os.Open(path)
+	raw, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return []Contact{}, nil
 		}
+		return nil, err
+	}
+	content := strings.TrimSpace(string(raw))
+	if content == "" {
+		return []Contact{}, nil
+	}
+
+	// Backward compatibility: older code could save contacts as JSON array.
+	if strings.HasPrefix(content, "[") {
+		var arr []Contact
+		if err := json.Unmarshal(raw, &arr); err != nil {
+			return nil, err
+		}
+		return arr, nil
+	}
+
+	file, err := os.Open(path)
+	if err != nil {
 		return nil, err
 	}
 	defer file.Close()

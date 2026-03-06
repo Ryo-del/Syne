@@ -212,6 +212,7 @@ func handleCommand(input string, openChat func(peerID, peerAddr string) error) e
 	}
 
 	switch parts[0] {
+
 	case "/contact":
 		if len(parts) < 2 {
 			return fmt.Errorf("usage: /contact add <name> <peer-id> <ip:port> | /contact list")
@@ -231,6 +232,15 @@ func handleCommand(input string, openChat func(peerID, peerAddr string) error) e
 				IP:     host,
 				Port:   port,
 			})
+		case "rename":
+			if len(parts) != 4 {
+				return fmt.Errorf("usage: /contact rename <old-name> <new-name>")
+			}
+			err := corechat.RenameContact(parts[2], parts[3])
+			if err != nil {
+				return err
+			}
+			return nil
 		case "list":
 			contacts, err := corechat.ListContacts()
 			if err != nil {
@@ -260,6 +270,7 @@ func handleCommand(input string, openChat func(peerID, peerAddr string) error) e
 	default:
 		return fmt.Errorf("unknown command")
 	}
+
 }
 
 func sendProtocolMessage(peer *transport.Peer, msg protocol.Message) error {
