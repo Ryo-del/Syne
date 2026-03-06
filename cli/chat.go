@@ -1,6 +1,7 @@
 package cli
 
 import (
+	corechat "Syne/core/chat"
 	"Syne/core/history"
 	"Syne/core/protocol"
 	"Syne/core/transport"
@@ -34,17 +35,6 @@ func RunChat(ctx context.Context, cfg Config) error {
 	if strings.TrimSpace(cfg.LocalID) == "" {
 		cfg.LocalID = "peer"
 	}
-	if strings.TrimSpace(cfg.PeerID) == "" {
-		cfg.PeerID = "peer"
-	}
-	if strings.TrimSpace(cfg.PeerAddr) == "" {
-		return fmt.Errorf("peer address is required")
-	}
-
-	peerAddr, err := net.ResolveTCPAddr("tcp", cfg.PeerAddr)
-	if err != nil {
-		return fmt.Errorf("resolve peer address: %w", err)
-	}
 
 	listener, err := transport.ListenTCP(cfg.LocalPort)
 	if err != nil {
@@ -52,23 +42,54 @@ func RunChat(ctx context.Context, cfg Config) error {
 	}
 	defer listener.Close()
 
-	peer := &transport.Peer{PeerID: cfg.PeerID, Addr: peerAddr}
-	chatID := privateChatID(cfg.LocalID, cfg.PeerID)
 	reader := bufio.NewReader(os.Stdin)
+	var stateMu sync.RWMutex
+	var activePeer *transport.Peer
+	var activeChatID string
 
-	fmt.Printf("Chat started. local=%s, me=%s, peer=%s (%s)\n", listener.Addr().String(), cfg.LocalID, peer.PeerID, peer.Addr.String())
-	fmt.Println("Type message + Enter. Ctrl+C to exit.")
-	if messages, err := history.LoadMessages(chatID); err != nil {
-		fmt.Printf("history load error: %v\n", err)
-	} else {
-		for _, histMsg := range messages {
-			fmt.Printf("\n<- [history] [%s]: %s - %s\n> ", chatID, histMsg.From, string(histMsg.Payload))
+	openChat := func(peerID, peerAddr string) error {
+		peerID = strings.TrimSpace(peerID)
+		peerAddr = strings.TrimSpace(peerAddr)
+		if peerID == "" || peerAddr == "" {
+			return fmt.Errorf("peer-id and peer-addr are required")
 		}
+		addr, err := net.ResolveTCPAddr("tcp", peerAddr)
+		if err != nil {
+			return fmt.Errorf("resolve peer address: %w", err)
+		}
+
+		peer := &transport.Peer{PeerID: peerID, Addr: addr}
+		chatID := privateChatID(cfg.LocalID, peerID)
+
+		stateMu.Lock()
+		activePeer = peer
+		activeChatID = chatID
+		stateMu.Unlock()
+
+		fmt.Printf("[system] active chat -> %s (%s) chatID=%s\n", peerID, peerAddr, chatID)
+		if messages, err := history.LoadMessages(chatID); err != nil {
+			fmt.Printf("history load error: %v\n", err)
+		} else {
+			for _, histMsg := range messages {
+				fmt.Printf("\n<- [history] [%s]: %s - %s\n> ", chatID, histMsg.From, string(histMsg.Payload))
+			}
+		}
+
+		join := protocol.NewJoin(chatID, cfg.LocalID, peerID)
+		if err := sendProtocolMessage(peer, join); err != nil {
+			fmt.Printf("join send error: %v\n", err)
+		}
+		return nil
 	}
 
-	join := protocol.NewJoin(chatID, cfg.LocalID, cfg.PeerID)
-	if err := sendProtocolMessage(peer, join); err != nil {
-		fmt.Printf("join send error: %v\n", err)
+	fmt.Printf("Chat started. local=%s, me=%s\n", listener.Addr().String(), cfg.LocalID)
+	fmt.Println("Commands: /contact add <name> <peer-id> <ip:port> | /contact list | /chat open <name-or-peer-id>")
+	fmt.Println("Then type text to send into active chat. Ctrl+C to exit.")
+
+	if strings.TrimSpace(cfg.PeerID) != "" && strings.TrimSpace(cfg.PeerAddr) != "" {
+		if err := openChat(cfg.PeerID, cfg.PeerAddr); err != nil {
+			fmt.Printf("initial chat open error: %v\n", err)
+		}
 	}
 
 	var wg sync.WaitGroup
@@ -105,7 +126,8 @@ func RunChat(ctx context.Context, cfg Config) error {
 			case protocol.MsgJoin:
 				fmt.Printf("\n[system] %s joined chat %s\n> ", msg.From, msg.ChatID)
 				ack := protocol.NewJoinAck(msg.ChatID, cfg.LocalID, msg.From)
-				if err := sendProtocolMessage(peer, ack); err != nil {
+				ackPeer := &transport.Peer{PeerID: msg.From, Addr: sender}
+				if err := sendProtocolMessage(ackPeer, ack); err != nil {
 					fmt.Printf("join ack send error: %v\n", err)
 				}
 			case protocol.MsgJoinAck:
@@ -145,13 +167,28 @@ func RunChat(ctx context.Context, cfg Config) error {
 		if text == "" {
 			continue
 		}
+		if strings.HasPrefix(text, "/") {
+			if err := handleCommand(text, openChat); err != nil {
+				fmt.Printf("command error: %v\n", err)
+			}
+			continue
+		}
+
+		stateMu.RLock()
+		peer := activePeer
+		chatID := activeChatID
+		stateMu.RUnlock()
+		if peer == nil || chatID == "" {
+			fmt.Println("no active chat. Use /chat open <name-or-peer-id> first")
+			continue
+		}
 
 		out := protocol.Message{
 			Version:   protocol.ProtocolVersion,
 			Type:      protocol.MsgChat,
 			Target:    protocol.TargetPeer,
 			MessageID: uuid.NewString(),
-			TargetID:  cfg.PeerID,
+			TargetID:  peer.PeerID,
 			ChatID:    chatID,
 			From:      cfg.LocalID,
 			Payload:   []byte(text),
@@ -165,6 +202,63 @@ func RunChat(ctx context.Context, cfg Config) error {
 		if err := history.SaveMessage(out); err != nil {
 			fmt.Printf("history save (outgoing) error: %v\n", err)
 		}
+	}
+}
+
+func handleCommand(input string, openChat func(peerID, peerAddr string) error) error {
+	parts := strings.Fields(input)
+	if len(parts) == 0 {
+		return nil
+	}
+
+	switch parts[0] {
+	case "/contact":
+		if len(parts) < 2 {
+			return fmt.Errorf("usage: /contact add <name> <peer-id> <ip:port> | /contact list")
+		}
+		switch parts[1] {
+		case "add":
+			if len(parts) != 5 {
+				return fmt.Errorf("usage: /contact add <name> <peer-id> <ip:port>")
+			}
+			host, port, err := net.SplitHostPort(parts[4])
+			if err != nil {
+				return fmt.Errorf("invalid address: %w", err)
+			}
+			return corechat.AddContact(corechat.Contact{
+				Name:   parts[2],
+				PeerID: parts[3],
+				IP:     host,
+				Port:   port,
+			})
+		case "list":
+			contacts, err := corechat.ListContacts()
+			if err != nil {
+				return err
+			}
+			if len(contacts) == 0 {
+				fmt.Println("[system] contacts are empty")
+				return nil
+			}
+			for _, c := range contacts {
+				fmt.Printf("[contact] %s | %s | %s\n", c.Name, c.PeerID, c.Address())
+			}
+			return nil
+		default:
+			return fmt.Errorf("unknown /contact command")
+		}
+
+	case "/chat":
+		if len(parts) != 3 || parts[1] != "open" {
+			return fmt.Errorf("usage: /chat open <name-or-peer-id>")
+		}
+		c, err := corechat.FindContact(parts[2])
+		if err != nil {
+			return err
+		}
+		return openChat(c.PeerID, c.Address())
+	default:
+		return fmt.Errorf("unknown command")
 	}
 }
 
