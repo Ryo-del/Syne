@@ -241,6 +241,16 @@ func handleCommand(input string, openChat func(peerID, peerAddr string) error) e
 				return err
 			}
 			return nil
+			case "delete":
+				if len(parts) != 3 {
+					return fmt.Errorf("usage: /contact delete <name-or-peer-id>")
+				}
+
+			err := corechat.DeleteContact(parts[2])
+			if err != nil {
+				return err
+			}
+			return nil
 		case "list":
 			contacts, err := corechat.ListContacts()
 			if err != nil {

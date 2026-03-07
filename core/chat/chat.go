@@ -20,6 +20,31 @@ type Contact struct {
 func (c Contact) Address() string {
 	return net.JoinHostPort(c.IP, c.Port)
 }
+
+func DeleteContact(query string) error {
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return fmt.Errorf("query is required")
+	}
+
+	contacts, err := ListContacts()
+	if err != nil {
+		return err
+	}
+	foundIndex := -1
+	for i := range contacts {
+		if contacts[i].PeerID == query || strings.EqualFold(contacts[i].Name, query) {
+			foundIndex = i
+			break
+		}
+	}
+
+	if foundIndex == -1 {
+		return fmt.Errorf("contact not found: %s", query)
+	}
+	contacts = append(contacts[:foundIndex], contacts[foundIndex+1:]...)
+	return writeContacts(contacts)
+}
 func RenameContact(old_Name, new_Name string) error {
 	old_Name = strings.TrimSpace(old_Name)
 	new_Name = strings.TrimSpace(new_Name)
