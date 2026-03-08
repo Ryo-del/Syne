@@ -45,29 +45,40 @@ func DeleteContact(query string) error {
 	contacts = append(contacts[:foundIndex], contacts[foundIndex+1:]...)
 	return writeContacts(contacts)
 }
-func RenameContact(old_Name, new_Name string) error {
-	old_Name = strings.TrimSpace(old_Name)
-	new_Name = strings.TrimSpace(new_Name)
-	if old_Name == "" || new_Name == "" {
-		return fmt.Errorf("old-name and new-name are required")
+func RenameContact(query, newName string) error {
+	query = strings.TrimSpace(query)
+	newName = strings.TrimSpace(newName)
+	if query == "" || newName == "" {
+		return fmt.Errorf("query and new-name are required")
 	}
 
 	contacts, err := ListContacts()
 	if err != nil {
 		return err
 	}
-	found := false
+
+	foundIndex := -1
 	for i := range contacts {
-		if contacts[i].Name == old_Name {
-			contacts[i].Name = new_Name
-			found = true
+		if contacts[i].PeerID == query || strings.EqualFold(contacts[i].Name, query) {
+			foundIndex = i
 			break
 		}
 	}
 
-	if !found {
-		return fmt.Errorf("contact with name %s not found", old_Name)
+	if foundIndex == -1 {
+		return fmt.Errorf("contact not found: %s", query)
 	}
+
+	for i := range contacts {
+		if i == foundIndex {
+			continue
+		}
+		if strings.EqualFold(contacts[i].Name, newName) {
+			return fmt.Errorf("contact name already exists: %s", newName)
+		}
+	}
+
+	contacts[foundIndex].Name = newName
 	return writeContacts(contacts)
 }
 func AddContact(c Contact) error {

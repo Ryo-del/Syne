@@ -47,9 +47,20 @@ func AcceptTCP(listener *net.TCPListener) (net.Conn, *net.TCPAddr, error) {
 	return conn, addr, nil
 }
 
-func ReceiveTCP(conn net.Conn) ([]byte, error) {
+func ReceiveTCP(conn net.Conn, maxBytes int64) ([]byte, error) {
 	defer conn.Close()
-	return io.ReadAll(conn)
+	if maxBytes <= 0 {
+		maxBytes = 64 * 1024
+	}
+	limited := &io.LimitedReader{R: conn, N: maxBytes + 1}
+	data, err := io.ReadAll(limited)
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxBytes {
+		return nil, fmt.Errorf("payload too large: %d > %d", len(data), maxBytes)
+	}
+	return data, nil
 }
 
 func IsPortFree(port int) bool {
