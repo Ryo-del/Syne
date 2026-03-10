@@ -155,23 +155,22 @@ func RunChat(ctx context.Context, cfg Config) error {
 			}
 
 			switch msg.Type {
-			case protocol.MsgJoin:
-				rateMu.Lock()
-				allowed := allowRate(rateStates, sender.IP.String(), time.Now(), 8, 16)
-				rateMu.Unlock()
-				if !allowed {
-					fmt.Printf("\n[system] rate limit exceeded for %s (join)\n> ", sender.IP.String())
-					continue
-				}
-				stateMu.Lock()
-				knownChats[msg.ChatID] = struct{}{}
-				stateMu.Unlock()
-				fmt.Printf("\n[system] %s joined chat %s\n> ", msg.From, msg.ChatID)
-				ack := protocol.NewJoinAck(msg.ChatID, cfg.LocalID, msg.From)
-				ackPeer := &transport.Peer{PeerID: msg.From, Addr: sender}
-				if err := sendProtocolMessage(ackPeer, ack); err != nil {
-					fmt.Printf("join ack send error: %v\n", err)
-				}
+				case protocol.MsgJoin:
+					rateMu.Lock()
+					allowed := allowRate(rateStates, sender.IP.String(), time.Now(), 8, 16)
+					rateMu.Unlock()
+					if !allowed {
+						fmt.Printf("\n[system] rate limit exceeded for %s (join)\n> ", sender.IP.String())
+						continue
+					}
+					stateMu.Lock()
+					knownChats[msg.ChatID] = struct{}{}
+					stateMu.Unlock()
+					fmt.Printf("\n[system] %s joined chat %s\n> ", msg.From, msg.ChatID)
+					ack := protocol.NewJoinAck(msg.ChatID, cfg.LocalID, msg.From)
+					if err := sendAckToContact(ack); err != nil {
+						fmt.Printf("join ack send error: %v\n", err)
+					}
 			case protocol.MsgJoinAck:
 				stateMu.Lock()
 				knownChats[msg.ChatID] = struct{}{}
@@ -414,6 +413,19 @@ func sendProtocolMessage(peer *transport.Peer, msg protocol.Message) error {
 		return fmt.Errorf("transport send: %w", err)
 	}
 	return nil
+}
+
+func sendAckToContact(msg protocol.Message) error {
+	c, err := corechat.FindContact(msg.TargetID)
+	if err != nil {
+		return fmt.Errorf("ack contact not found: %w", err)
+	}
+	addr, err := net.ResolveTCPAddr("tcp", c.Address())
+	if err != nil {
+		return fmt.Errorf("ack resolve address: %w", err)
+	}
+	peer := &transport.Peer{PeerID: c.PeerID, Addr: addr}
+	return sendProtocolMessage(peer, msg)
 }
 
 func privateChatID(a, b string) string {
