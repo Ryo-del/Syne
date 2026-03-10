@@ -32,6 +32,8 @@ type rateState struct {
 	last   time.Time
 }
 
+const defaultHopTTL = 4
+
 func allowRate(states map[string]*rateState, key string, now time.Time, ratePerSec, burst float64) bool {
 	s, ok := states[key]
 	if !ok {
@@ -71,6 +73,7 @@ func RunChat(ctx context.Context, cfg Config) error {
 	var activePeer *transport.Peer
 	var activeChatID string
 	knownChats := make(map[string]struct{})
+	seenMessages := make(map[string]time.Time)
 	rateStates := make(map[string]*rateState)
 	var rateMu sync.Mutex
 
@@ -111,7 +114,7 @@ func RunChat(ctx context.Context, cfg Config) error {
 	}
 
 	fmt.Printf("Chat started. local=%s, me=%s\n", listener.Addr().String(), cfg.LocalID)
-		fmt.Println("Commands: /contact add <name> <peer-id> <ip:port> | /contact rename <name-or-peer-id> <new-name> | /contact delete <name-or-peer-id> | /contact list | /chat open <name-or-peer-id>")
+	fmt.Println("Commands: /contact add <name> <peer-id> <ip:port> | /contact rename <name-or-peer-id> <new-name> | /contact delete <name-or-peer-id> | /contact list | /chat open <name-or-peer-id>")
 	fmt.Println("Then type text to send into active chat. Ctrl+C to exit.")
 
 	if strings.TrimSpace(cfg.PeerID) != "" && strings.TrimSpace(cfg.PeerAddr) != "" {
@@ -151,49 +154,64 @@ func RunChat(ctx context.Context, cfg Config) error {
 				continue
 			}
 
-				switch msg.Type {
-				case protocol.MsgJoin:
-					rateMu.Lock()
-					allowed := allowRate(rateStates, sender.IP.String(), time.Now(), 8, 16)
-					rateMu.Unlock()
-					if !allowed {
-						fmt.Printf("\n[system] rate limit exceeded for %s (join)\n> ", sender.IP.String())
-						continue
-					}
-					stateMu.Lock()
-					knownChats[msg.ChatID] = struct{}{}
-					stateMu.Unlock()
-					fmt.Printf("\n[system] %s joined chat %s\n> ", msg.From, msg.ChatID)
-					ack := protocol.NewJoinAck(msg.ChatID, cfg.LocalID, msg.From)
-					ackPeer := &transport.Peer{PeerID: msg.From, Addr: sender}
-					if err := sendProtocolMessage(ackPeer, ack); err != nil {
-						fmt.Printf("join ack send error: %v\n", err)
-					}
-				case protocol.MsgJoinAck:
-					stateMu.Lock()
-					knownChats[msg.ChatID] = struct{}{}
-					stateMu.Unlock()
-					fmt.Printf("\n[system] %s acknowledged join for %s\n> ", msg.From, msg.ChatID)
-				case protocol.MsgChat:
-					rateMu.Lock()
-					allowed := allowRate(rateStates, sender.IP.String(), time.Now(), 20, 40)
-					rateMu.Unlock()
-					if !allowed {
-						fmt.Printf("\n[system] rate limit exceeded for %s (chat)\n> ", sender.IP.String())
-						continue
-					}
-					stateMu.RLock()
-					_, known := knownChats[msg.ChatID]
-					active := msg.ChatID == activeChatID
-					stateMu.RUnlock()
-					if !known && !active {
-						fmt.Printf("\n[system] unknown chat id %s from %s (dropped)\n> ", msg.ChatID, msg.From)
-						continue
-					}
-					fmt.Printf("\n<- %s [%s]: %s\n> ", msg.From, msg.ChatID, string(msg.Payload))
+			switch msg.Type {
+			case protocol.MsgJoin:
+				rateMu.Lock()
+				allowed := allowRate(rateStates, sender.IP.String(), time.Now(), 8, 16)
+				rateMu.Unlock()
+				if !allowed {
+					fmt.Printf("\n[system] rate limit exceeded for %s (join)\n> ", sender.IP.String())
+					continue
+				}
+				stateMu.Lock()
+				knownChats[msg.ChatID] = struct{}{}
+				stateMu.Unlock()
+				fmt.Printf("\n[system] %s joined chat %s\n> ", msg.From, msg.ChatID)
+				ack := protocol.NewJoinAck(msg.ChatID, cfg.LocalID, msg.From)
+				ackPeer := &transport.Peer{PeerID: msg.From, Addr: sender}
+				if err := sendProtocolMessage(ackPeer, ack); err != nil {
+					fmt.Printf("join ack send error: %v\n", err)
+				}
+			case protocol.MsgJoinAck:
+				stateMu.Lock()
+				knownChats[msg.ChatID] = struct{}{}
+				stateMu.Unlock()
+				fmt.Printf("\n[system] %s acknowledged join for %s\n> ", msg.From, msg.ChatID)
+			case protocol.MsgChat:
+				if msg.MessageID == "" {
+					fmt.Printf("\n[system] missing message_id from %s (dropped)\n> ", msg.From)
+					continue
+				}
+
+				rateMu.Lock()
+				allowed := allowRate(rateStates, sender.IP.String(), time.Now(), 20, 40)
+				rateMu.Unlock()
+				if !allowed {
+					fmt.Printf("\n[system] rate limit exceeded for %s\n> ", sender.IP.String())
+					continue
+				}
+
+				if isSeen(seenMessages, msg.MessageID, time.Now(), 10*time.Minute) {
+					continue
+				}
+
+				if msg.TargetID == cfg.LocalID {
+					hopsTaken := defaultHopTTL - msg.HopTTL
+					fmt.Printf("\n<- %s [%s] (via %d hops, last relay: %s): %s\n> ", msg.From, msg.ChatID, hopsTaken, sender.IP.String(), string(msg.Payload))
 					if err := history.SaveMessage(msg); err != nil {
-						fmt.Printf("history save (incoming) error: %v\n", err)
+						fmt.Printf("history save error: %v\n", err)
 					}
+				} else {
+					if msg.HopTTL <= 1 {
+						fmt.Printf("\n[system] TTL expired for msg %s from %s\n> ", msg.MessageID, msg.From)
+						continue
+					}
+					msg.HopTTL--
+					fmt.Printf("\n[system] Relay: forwarding msg from %s to %s (TTL: %d)\n> ", msg.From, msg.TargetID, msg.HopTTL)
+					if err := forwardToNeighbors(msg, sender); err != nil {
+						fmt.Printf("\n[system] forward error: %v\n> ", err)
+					}
+				}
 			default:
 				fmt.Printf("\n[system] %s [%s] from %s\n> ", msg.Type.String(), msg.ChatID, msg.From)
 			}
@@ -245,6 +263,7 @@ func RunChat(ctx context.Context, cfg Config) error {
 			Type:      protocol.MsgChat,
 			Target:    protocol.TargetPeer,
 			MessageID: uuid.NewString(),
+			HopTTL:    defaultHopTTL,
 			TargetID:  peer.PeerID,
 			ChatID:    chatID,
 			From:      cfg.LocalID,
@@ -260,6 +279,49 @@ func RunChat(ctx context.Context, cfg Config) error {
 			fmt.Printf("history save (outgoing) error: %v\n", err)
 		}
 	}
+}
+
+func forwardToNeighbors(msg protocol.Message, sender *net.TCPAddr) error {
+	contacts, err := corechat.ListContacts()
+	if err != nil {
+		return err
+	}
+	for _, c := range contacts {
+		if c.PeerID == msg.From {
+			continue
+		}
+		addrStr := c.Address()
+		if sender != nil && sender.String() == addrStr {
+			continue
+		}
+		addr, err := net.ResolveTCPAddr("tcp", addrStr)
+		if err != nil {
+			continue
+		}
+		peer := &transport.Peer{PeerID: c.PeerID, Addr: addr}
+		go func(p *transport.Peer, m protocol.Message) {
+			_ = sendProtocolMessage(p, m)
+		}(peer, msg)
+	}
+	return nil
+}
+
+func isSeen(cache map[string]time.Time, id string, now time.Time, ttl time.Duration) bool {
+	if id == "" {
+		return false
+	}
+	if ts, ok := cache[id]; ok {
+		if now.Sub(ts) <= ttl {
+			return true
+		}
+	}
+	cache[id] = now
+	for k, v := range cache {
+		if now.Sub(v) > ttl {
+			delete(cache, k)
+		}
+	}
+	return false
 }
 
 func handleCommand(input string, openChat func(peerID, peerAddr string) error) error {
@@ -289,19 +351,19 @@ func handleCommand(input string, openChat func(peerID, peerAddr string) error) e
 				IP:     host,
 				Port:   port,
 			})
-			case "rename":
-				if len(parts) != 4 {
-					return fmt.Errorf("usage: /contact rename <name-or-peer-id> <new-name>")
-				}
-				err := corechat.RenameContact(parts[2], parts[3])
+		case "rename":
+			if len(parts) != 4 {
+				return fmt.Errorf("usage: /contact rename <name-or-peer-id> <new-name>")
+			}
+			err := corechat.RenameContact(parts[2], parts[3])
 			if err != nil {
 				return err
 			}
 			return nil
-			case "delete":
-				if len(parts) != 3 {
-					return fmt.Errorf("usage: /contact delete <name-or-peer-id>")
-				}
+		case "delete":
+			if len(parts) != 3 {
+				return fmt.Errorf("usage: /contact delete <name-or-peer-id>")
+			}
 
 			err := corechat.DeleteContact(parts[2])
 			if err != nil {

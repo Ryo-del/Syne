@@ -1,0 +1,1359 @@
+main.go
+package main
+
+import (
+	"Syne/cli"
+	"Syne/core/transport"
+
+	"context"
+	"flag"
+	"fmt"
+	"log"
+	"os"
+	"os/signal"
+	"syscall"
+
+	"github.com/google/uuid"
+)
+
+var ID string
+var PeerAddr string
+var PeerID string
+var Port int
+
+/*
+--id = мой ID - flag
+--port = на каком порту я слушаю - auto
+--peer-id = ID собеседника - flag
+--peer-addr = адрес собеседника (IP:port) - flag
+*/
+func main() {
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+	flag.StringVar(&ID, "id", "", "Your peer ID")
+	flag.IntVar(&Port, "port", 3000, "Local TCP port (auto-picks next free if busy)")
+	flag.StringVar(&PeerID, "peer-id", "peer", "Peer ID to chat with")
+	flag.StringVar(&PeerAddr, "peer-addr", "", "Peer address (IP:port)")
+	flag.Parse()
+
+	if ID == "" {
+		ID = uuid.NewString()
+	}
+
+	port := Port
+	for !transport.IsPortFree(port) {
+		port++
+	}
+	fmt.Printf("Using local port: %d\n", port)
+	fmt.Printf("Local peer ID: %s\n", ID)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		err := cli.RunChat(ctx, cli.Config{
+			LocalPort: port,
+			PeerID:    PeerID,
+			LocalID:   ID,
+			PeerAddr:  PeerAddr,
+		})
+		if err != nil {
+			log.Default().Printf("Chat error: %v", err)
+		}
+	}()
+	<-ctx.Done()
+	fmt.Println("Shutting down gracefully...")
+	<-done
+}
+
+cli/chat.go
+package cli
+
+import (
+	corechat "Syne/core/chat"
+	"Syne/core/history"
+	"Syne/core/protocol"
+	"Syne/core/transport"
+	"bufio"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// Config contains minimal settings for local P2P chat testing.
+type Config struct {
+	LocalPort int
+	LocalID   string
+	PeerID    string
+	PeerAddr  string
+}
+
+type rateState struct {
+	tokens float64
+	last   time.Time
+}
+
+func allowRate(states map[string]*rateState, key string, now time.Time, ratePerSec, burst float64) bool {
+	s, ok := states[key]
+	if !ok {
+		states[key] = &rateState{tokens: burst - 1, last: now}
+		return true
+	}
+	elapsed := now.Sub(s.last).Seconds()
+	s.tokens += elapsed * ratePerSec
+	if s.tokens > burst {
+		s.tokens = burst
+	}
+	s.last = now
+	if s.tokens < 1 {
+		return false
+	}
+	s.tokens -= 1
+	return true
+}
+
+// RunChat starts a terminal chat over TCP with protocol.Message framing.
+func RunChat(ctx context.Context, cfg Config) error {
+	if cfg.LocalPort <= 0 {
+		return fmt.Errorf("local port must be > 0")
+	}
+	if strings.TrimSpace(cfg.LocalID) == "" {
+		cfg.LocalID = "peer"
+	}
+
+	listener, err := transport.ListenTCP(cfg.LocalPort)
+	if err != nil {
+		return fmt.Errorf("listen tcp: %w", err)
+	}
+	defer listener.Close()
+
+	reader := bufio.NewReader(os.Stdin)
+	var stateMu sync.RWMutex
+	var activePeer *transport.Peer
+	var activeChatID string
+	knownChats := make(map[string]struct{})
+	seenMessages := make(map[string]time.Time)
+	rateStates := make(map[string]*rateState)
+	var rateMu sync.Mutex
+
+	openChat := func(peerID, peerAddr string) error {
+		peerID = strings.TrimSpace(peerID)
+		peerAddr = strings.TrimSpace(peerAddr)
+		if peerID == "" || peerAddr == "" {
+			return fmt.Errorf("peer-id and peer-addr are required")
+		}
+		addr, err := net.ResolveTCPAddr("tcp", peerAddr)
+		if err != nil {
+			return fmt.Errorf("resolve peer address: %w", err)
+		}
+
+		peer := &transport.Peer{PeerID: peerID, Addr: addr}
+		chatID := privateChatID(cfg.LocalID, peerID)
+
+		stateMu.Lock()
+		activePeer = peer
+		activeChatID = chatID
+		knownChats[chatID] = struct{}{}
+		stateMu.Unlock()
+
+		fmt.Printf("[system] active chat -> %s (%s) chatID=%s\n", peerID, peerAddr, chatID)
+		if messages, err := history.LoadMessages(chatID); err != nil {
+			fmt.Printf("history load error: %v\n", err)
+		} else {
+			for _, histMsg := range messages {
+				fmt.Printf("\n<- [history] [%s]: %s - %s\n> ", chatID, histMsg.From, string(histMsg.Payload))
+			}
+		}
+
+		join := protocol.NewJoin(chatID, cfg.LocalID, peerID)
+		if err := sendProtocolMessage(peer, join); err != nil {
+			fmt.Printf("join send error: %v\n", err)
+		}
+		return nil
+	}
+
+	fmt.Printf("Chat started. local=%s, me=%s\n", listener.Addr().String(), cfg.LocalID)
+	fmt.Println("Commands: /contact add <name> <peer-id> <ip:port> | /contact rename <name-or-peer-id> <new-name> | /contact delete <name-or-peer-id> | /contact list | /chat open <name-or-peer-id>")
+	fmt.Println("Then type text to send into active chat. Ctrl+C to exit.")
+
+	if strings.TrimSpace(cfg.PeerID) != "" && strings.TrimSpace(cfg.PeerAddr) != "" {
+		if err := openChat(cfg.PeerID, cfg.PeerAddr); err != nil {
+			fmt.Printf("initial chat open error: %v\n", err)
+		}
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			conn, sender, err := transport.AcceptTCP(listener)
+			if err != nil {
+				if errors.Is(err, net.ErrClosed) {
+					return
+				}
+				fmt.Printf("accept error: %v\n", err)
+				return
+			}
+
+			_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+			data, err := transport.ReceiveTCP(conn, 64*1024)
+			if err != nil {
+				fmt.Printf("receive error from %s: %v\n", sender.String(), err)
+				continue
+			}
+
+			msg, err := protocol.UnmarshalMessage(data)
+			if err != nil {
+				fmt.Printf("decode error from %s: %v\n", sender.String(), err)
+				continue
+			}
+			if err := protocol.ValidateMessage(msg); err != nil {
+				fmt.Printf("invalid message from %s: %v\n", sender.String(), err)
+				continue
+			}
+
+			switch msg.Type {
+			case protocol.MsgJoin:
+				rateMu.Lock()
+				allowed := allowRate(rateStates, sender.IP.String(), time.Now(), 8, 16)
+				rateMu.Unlock()
+				if !allowed {
+					fmt.Printf("\n[system] rate limit exceeded for %s (join)\n> ", sender.IP.String())
+					continue
+				}
+				stateMu.Lock()
+				knownChats[msg.ChatID] = struct{}{}
+				stateMu.Unlock()
+				fmt.Printf("\n[system] %s joined chat %s\n> ", msg.From, msg.ChatID)
+				ack := protocol.NewJoinAck(msg.ChatID, cfg.LocalID, msg.From)
+				ackPeer := &transport.Peer{PeerID: msg.From, Addr: sender}
+				if err := sendProtocolMessage(ackPeer, ack); err != nil {
+					fmt.Printf("join ack send error: %v\n", err)
+				}
+			case protocol.MsgJoinAck:
+				stateMu.Lock()
+				knownChats[msg.ChatID] = struct{}{}
+				stateMu.Unlock()
+				fmt.Printf("\n[system] %s acknowledged join for %s\n> ", msg.From, msg.ChatID)
+			case protocol.MsgChat:
+				if msg.MessageID == "" {
+					fmt.Printf("\n[system] missing message_id from %s (dropped)\n> ", msg.From)
+					continue
+				}
+				rateMu.Lock()
+				allowed := allowRate(rateStates, sender.IP.String(), time.Now(), 20, 40)
+				rateMu.Unlock()
+				if !allowed {
+					fmt.Printf("\n[system] rate limit exceeded for %s (chat)\n> ", sender.IP.String())
+					continue
+				}
+				if isSeen(seenMessages, msg.MessageID, time.Now(), 10*time.Minute) {
+					continue
+				}
+				if msg.TargetID != cfg.LocalID {
+					if msg.HopTTL <= 0 {
+						fmt.Printf("\n[system] ttl expired for %s -> %s\n> ", msg.From, msg.TargetID)
+						continue
+					}
+					msg.HopTTL--
+					if err := forwardToNeighbors(msg, sender); err != nil {
+						fmt.Printf("\n[system] forward error: %v\n> ", err)
+					}
+					continue
+				}
+
+				stateMu.RLock()
+				_, known := knownChats[msg.ChatID]
+				active := msg.ChatID == activeChatID
+				stateMu.RUnlock()
+				if !known && !active {
+					fmt.Printf("\n[system] unknown chat id %s from %s (dropped)\n> ", msg.ChatID, msg.From)
+					continue
+				}
+				fmt.Printf("\n<- %s [%s]: %s\n> ", msg.From, msg.ChatID, string(msg.Payload))
+				if err := history.SaveMessage(msg); err != nil {
+					fmt.Printf("history save (incoming) error: %v\n", err)
+				}
+			default:
+				fmt.Printf("\n[system] %s [%s] from %s\n> ", msg.Type.String(), msg.ChatID, msg.From)
+			}
+		}
+	}()
+
+	for {
+		select {
+		case <-ctx.Done():
+			_ = listener.Close()
+			wg.Wait()
+			return nil
+		default:
+		}
+
+		fmt.Print("> ")
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				_ = listener.Close()
+				wg.Wait()
+				return nil
+			}
+			return fmt.Errorf("read stdin: %w", err)
+		}
+
+		text := strings.TrimSpace(line)
+		if text == "" {
+			continue
+		}
+		if strings.HasPrefix(text, "/") {
+			if err := handleCommand(text, openChat); err != nil {
+				fmt.Printf("command error: %v\n", err)
+			}
+			continue
+		}
+
+		stateMu.RLock()
+		peer := activePeer
+		chatID := activeChatID
+		stateMu.RUnlock()
+		if peer == nil || chatID == "" {
+			fmt.Println("no active chat. Use /chat open <name-or-peer-id> first")
+			continue
+		}
+
+		out := protocol.Message{
+			Version:   protocol.ProtocolVersion,
+			Type:      protocol.MsgChat,
+			Target:    protocol.TargetPeer,
+			MessageID: uuid.NewString(),
+			HopTTL:    4,
+			TargetID:  peer.PeerID,
+			ChatID:    chatID,
+			From:      cfg.LocalID,
+			Payload:   []byte(text),
+			Timestamp: time.Now().UnixMilli(),
+		}
+
+		if err := sendProtocolMessage(peer, out); err != nil {
+			fmt.Printf("send error: %v\n", err)
+			continue
+		}
+		if err := history.SaveMessage(out); err != nil {
+			fmt.Printf("history save (outgoing) error: %v\n", err)
+		}
+	}
+}
+
+func forwardToNeighbors(msg protocol.Message, sender *net.TCPAddr) error {
+	contacts, err := corechat.ListContacts()
+	if err != nil {
+		return err
+	}
+	for _, c := range contacts {
+		if c.PeerID == msg.From {
+			continue
+		}
+		addrStr := c.Address()
+		if sender != nil && sender.String() == addrStr {
+			continue
+		}
+		addr, err := net.ResolveTCPAddr("tcp", addrStr)
+		if err != nil {
+			continue
+		}
+		peer := &transport.Peer{PeerID: c.PeerID, Addr: addr}
+		if err := sendProtocolMessage(peer, msg); err != nil {
+			continue
+		}
+	}
+	return nil
+}
+
+func isSeen(cache map[string]time.Time, id string, now time.Time, ttl time.Duration) bool {
+	if id == "" {
+		return false
+	}
+	if ts, ok := cache[id]; ok {
+		if now.Sub(ts) <= ttl {
+			return true
+		}
+	}
+	cache[id] = now
+	for k, v := range cache {
+		if now.Sub(v) > ttl {
+			delete(cache, k)
+		}
+	}
+	return false
+}
+
+func handleCommand(input string, openChat func(peerID, peerAddr string) error) error {
+	parts := strings.Fields(input)
+	if len(parts) == 0 {
+		return nil
+	}
+
+	switch parts[0] {
+
+	case "/contact":
+		if len(parts) < 2 {
+			return fmt.Errorf("usage: /contact add <name> <peer-id> <ip:port> | /contact list")
+		}
+		switch parts[1] {
+		case "add":
+			if len(parts) != 5 {
+				return fmt.Errorf("usage: /contact add <name> <peer-id> <ip:port>")
+			}
+			host, port, err := net.SplitHostPort(parts[4])
+			if err != nil {
+				return fmt.Errorf("invalid address: %w", err)
+			}
+			return corechat.AddContact(corechat.Contact{
+				Name:   parts[2],
+				PeerID: parts[3],
+				IP:     host,
+				Port:   port,
+			})
+		case "rename":
+			if len(parts) != 4 {
+				return fmt.Errorf("usage: /contact rename <name-or-peer-id> <new-name>")
+			}
+			err := corechat.RenameContact(parts[2], parts[3])
+			if err != nil {
+				return err
+			}
+			return nil
+		case "delete":
+			if len(parts) != 3 {
+				return fmt.Errorf("usage: /contact delete <name-or-peer-id>")
+			}
+
+			err := corechat.DeleteContact(parts[2])
+			if err != nil {
+				return err
+			}
+			return nil
+		case "list":
+			contacts, err := corechat.ListContacts()
+			if err != nil {
+				return err
+			}
+			if len(contacts) == 0 {
+				fmt.Println("[system] contacts are empty")
+				return nil
+			}
+			for _, c := range contacts {
+				fmt.Printf("[contact] %s | %s | %s\n", c.Name, c.PeerID, c.Address())
+			}
+			return nil
+		default:
+			return fmt.Errorf("unknown /contact command")
+		}
+
+	case "/chat":
+		if len(parts) != 3 || parts[1] != "open" {
+			return fmt.Errorf("usage: /chat open <name-or-peer-id>")
+		}
+		c, err := corechat.FindContact(parts[2])
+		if err != nil {
+			return err
+		}
+		return openChat(c.PeerID, c.Address())
+	default:
+		return fmt.Errorf("unknown command")
+	}
+
+}
+
+func sendProtocolMessage(peer *transport.Peer, msg protocol.Message) error {
+	if err := protocol.ValidateMessage(msg); err != nil {
+		return fmt.Errorf("message build error: %w", err)
+	}
+	wire, err := protocol.MarshalMessage(msg)
+	if err != nil {
+		return fmt.Errorf("encode error: %w", err)
+	}
+	if err := transport.SendTCP(peer, wire); err != nil {
+		return fmt.Errorf("transport send: %w", err)
+	}
+	return nil
+}
+
+func privateChatID(a, b string) string {
+	if a <= b {
+		return "dm:" + a + ":" + b
+	}
+	return "dm:" + b + ":" + a
+}
+
+core/chat/chat.go
+package chat
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"path/filepath"
+	"strings"
+)
+
+type Contact struct {
+	Name   string `json:"name"`
+	PeerID string `json:"peer_id"`
+	IP     string `json:"ip"`
+	Port   string `json:"port"`
+}
+
+func (c Contact) Address() string {
+	return net.JoinHostPort(c.IP, c.Port)
+}
+
+func DeleteContact(query string) error {
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return fmt.Errorf("query is required")
+	}
+
+	contacts, err := ListContacts()
+	if err != nil {
+		return err
+	}
+	foundIndex := -1
+	for i := range contacts {
+		if contacts[i].PeerID == query || strings.EqualFold(contacts[i].Name, query) {
+			foundIndex = i
+			break
+		}
+	}
+
+	if foundIndex == -1 {
+		return fmt.Errorf("contact not found: %s", query)
+	}
+	contacts = append(contacts[:foundIndex], contacts[foundIndex+1:]...)
+	return writeContacts(contacts)
+}
+func RenameContact(query, newName string) error {
+	query = strings.TrimSpace(query)
+	newName = strings.TrimSpace(newName)
+	if query == "" || newName == "" {
+		return fmt.Errorf("query and new-name are required")
+	}
+
+	contacts, err := ListContacts()
+	if err != nil {
+		return err
+	}
+
+	foundIndex := -1
+	for i := range contacts {
+		if contacts[i].PeerID == query || strings.EqualFold(contacts[i].Name, query) {
+			foundIndex = i
+			break
+		}
+	}
+
+	if foundIndex == -1 {
+		return fmt.Errorf("contact not found: %s", query)
+	}
+
+	for i := range contacts {
+		if i == foundIndex {
+			continue
+		}
+		if strings.EqualFold(contacts[i].Name, newName) {
+			return fmt.Errorf("contact name already exists: %s", newName)
+		}
+	}
+
+	contacts[foundIndex].Name = newName
+	return writeContacts(contacts)
+}
+func AddContact(c Contact) error {
+	c.Name = strings.TrimSpace(c.Name)
+	c.PeerID = strings.TrimSpace(c.PeerID)
+	c.IP = strings.TrimSpace(c.IP)
+	c.Port = strings.TrimSpace(c.Port)
+	if c.Name == "" || c.PeerID == "" || c.IP == "" || c.Port == "" {
+		return fmt.Errorf("name, peer_id, ip and port are required")
+	}
+	if _, err := net.ResolveTCPAddr("tcp", c.Address()); err != nil {
+		return fmt.Errorf("invalid contact address: %w", err)
+	}
+
+	contacts, err := ListContacts()
+	if err != nil {
+		return err
+	}
+
+	updated := false
+	for i := range contacts {
+		if contacts[i].PeerID == c.PeerID || strings.EqualFold(contacts[i].Name, c.Name) {
+			contacts[i] = c
+			updated = true
+			break
+		}
+	}
+	if !updated {
+		contacts = append(contacts, c)
+	}
+	return writeContacts(contacts)
+}
+
+func ListContacts() ([]Contact, error) {
+	path, err := ContactFilePath()
+	if err != nil {
+		return nil, err
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return []Contact{}, nil
+		}
+		return nil, err
+	}
+	content := strings.TrimSpace(string(raw))
+	if content == "" {
+		return []Contact{}, nil
+	}
+
+	// Backward compatibility: older code could save contacts as JSON array.
+	if strings.HasPrefix(content, "[") {
+		var arr []Contact
+		if err := json.Unmarshal(raw, &arr); err != nil {
+			return nil, err
+		}
+		return arr, nil
+	}
+
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	var contacts []Contact
+	decoder := json.NewDecoder(file)
+	for {
+		var c Contact
+		if err := decoder.Decode(&c); err != nil {
+			if err == io.EOF {
+				break
+			}
+			return nil, err
+		}
+		contacts = append(contacts, c)
+	}
+	return contacts, nil
+}
+
+func FindContact(query string) (Contact, error) {
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return Contact{}, fmt.Errorf("query is required")
+	}
+	contacts, err := ListContacts()
+	if err != nil {
+		return Contact{}, err
+	}
+	for _, c := range contacts {
+		if c.PeerID == query || strings.EqualFold(c.Name, query) {
+			return c, nil
+		}
+	}
+	return Contact{}, fmt.Errorf("contact not found: %s", query)
+}
+
+func writeContacts(contacts []Contact) error {
+	path, err := ContactFilePath()
+	if err != nil {
+		return err
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	encoder := json.NewEncoder(file)
+	for _, c := range contacts {
+		if err := encoder.Encode(c); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func ContactFilePath() (string, error) {
+	contactsDir := filepath.Join("data", "contacts")
+	if err := os.MkdirAll(contactsDir, 0o755); err != nil {
+		return "", err
+	}
+	return filepath.Join(contactsDir, "contacts.jsonl"), nil
+}
+
+core/chat/chat_test.go
+package chat
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+func withTempCWD(t *testing.T) string {
+	t.Helper()
+	prev, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmp := t.TempDir()
+	if err := os.Chdir(tmp); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(prev) })
+	return tmp
+}
+
+func TestContactCRUD(t *testing.T) {
+	_ = withTempCWD(t)
+
+	if err := AddContact(Contact{Name: "alice", PeerID: "A", IP: "127.0.0.1", Port: "3000"}); err != nil {
+		t.Fatalf("add contact: %v", err)
+	}
+	if err := AddContact(Contact{Name: "bob", PeerID: "B", IP: "127.0.0.1", Port: "3001"}); err != nil {
+		t.Fatalf("add contact: %v", err)
+	}
+
+	list, err := ListContacts()
+	if err != nil {
+		t.Fatalf("list contacts: %v", err)
+	}
+	if len(list) != 2 {
+		t.Fatalf("expected 2 contacts, got %d", len(list))
+	}
+
+	got, err := FindContact("alice")
+	if err != nil || got.PeerID != "A" {
+		t.Fatalf("find alice failed: %+v, err=%v", got, err)
+	}
+
+	if err := RenameContact("A", "Artem"); err != nil {
+		t.Fatalf("rename by peer id: %v", err)
+	}
+	got, err = FindContact("Artem")
+	if err != nil || got.PeerID != "A" {
+		t.Fatalf("find renamed contact failed: %+v, err=%v", got, err)
+	}
+
+	if err := DeleteContact("B"); err != nil {
+		t.Fatalf("delete by peer id: %v", err)
+	}
+	list, err = ListContacts()
+	if err != nil {
+		t.Fatalf("list after delete: %v", err)
+	}
+	if len(list) != 1 || list[0].PeerID != "A" {
+		t.Fatalf("unexpected contacts after delete: %+v", list)
+	}
+
+	if _, err := os.Stat(filepath.Join("data", "contacts", "contacts.jsonl")); err != nil {
+		t.Fatalf("contacts file missing: %v", err)
+	}
+}
+
+func TestRenameConflict(t *testing.T) {
+	_ = withTempCWD(t)
+
+	_ = AddContact(Contact{Name: "alice", PeerID: "A", IP: "127.0.0.1", Port: "3000"})
+	_ = AddContact(Contact{Name: "bob", PeerID: "B", IP: "127.0.0.1", Port: "3001"})
+
+	if err := RenameContact("bob", "alice"); err == nil {
+		t.Fatalf("expected rename conflict error")
+	}
+}
+
+core/crypto/keys.go
+package crypto
+
+// KeyPair describes an identity key pair for anonymous accounts.
+type KeyPair struct {
+	PublicKey  []byte
+	PrivateKey []byte
+}
+
+core/discovery/lan.go
+package discovery
+
+// LANDiscovery is a placeholder for UDP multicast peer discovery.
+type LANDiscovery struct{}
+
+core/history/storage.go
+package history
+
+import (
+	"Syne/core/protocol"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"time"
+)
+
+type StoredMessage struct {
+	Version   uint8  `json:"version"`
+	Type      uint8  `json:"type"`
+	Target    uint8  `json:"target"`
+	MessageID string `json:"message_id,omitempty"`
+	TargetID  string `json:"target_id"`
+	ChatID    string `json:"chat_id"`
+	From      string `json:"from"`
+	Payload   []byte `json:"payload"`
+	Timestamp int64  `json:"timestamp"`
+}
+
+func SaveMessage(msg protocol.Message) error {
+	path, err := historyFilePath(msg.ChatID)
+	if err != nil {
+		return err
+	}
+
+	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o644)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	unlock, err := acquireFileLock(path + ".lock")
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	stored := StoredMessage{
+		Version:   msg.Version,
+		Type:      uint8(msg.Type),
+		Target:    uint8(msg.Target),
+		MessageID: msg.MessageID,
+		TargetID:  msg.TargetID,
+		ChatID:    msg.ChatID,
+		From:      msg.From,
+		Payload:   msg.Payload,
+		Timestamp: msg.Timestamp,
+	}
+
+	if stored.MessageID != "" {
+		exists, err := hasMessageIDInFile(file, stored.MessageID)
+		if err != nil {
+			return err
+		}
+		if exists {
+			return nil
+		}
+	}
+
+	data, err := json.Marshal(stored)
+	if err != nil {
+		return err
+	}
+
+	if _, err := file.Seek(0, io.SeekEnd); err != nil {
+		return err
+	}
+	_, err = file.Write(append(data, '\n'))
+	return err
+}
+
+func LoadMessages(chatID string) ([]StoredMessage, error) {
+	path, err := historyFilePath(chatID)
+	if err != nil {
+		return nil, err
+	}
+
+	file, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return []StoredMessage{}, nil
+		}
+		return nil, err
+	}
+	defer file.Close()
+
+	var messages []StoredMessage
+	decoder := json.NewDecoder(file)
+	for {
+		var stored StoredMessage
+		if err := decoder.Decode(&stored); err != nil {
+			if err == io.EOF {
+				break
+			}
+			return nil, err
+		}
+		messages = append(messages, stored)
+	}
+	return messages, nil
+}
+
+func historyFilePath(chatID string) (string, error) {
+	historyDir := filepath.Join("data", "history")
+	if err := os.MkdirAll(historyDir, 0o755); err != nil {
+		return "", err
+	}
+
+	sum := sha256.Sum256([]byte(chatID))
+	safeName := hex.EncodeToString(sum[:])
+	return filepath.Join(historyDir, safeName+".jsonl"), nil
+}
+
+func hasMessageIDInFile(file *os.File, messageID string) (bool, error) {
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return false, err
+	}
+	decoder := json.NewDecoder(file)
+	for {
+		var stored StoredMessage
+		if err := decoder.Decode(&stored); err != nil {
+			if err == io.EOF {
+				return false, nil
+			}
+			return false, err
+		}
+		if stored.MessageID != "" && stored.MessageID == messageID {
+			return true, nil
+		}
+	}
+}
+
+func acquireFileLock(lockPath string) (func(), error) {
+	const (
+		waitStep = 20 * time.Millisecond
+		timeout  = 3 * time.Second
+	)
+
+	deadline := time.Now().Add(timeout)
+	for {
+		lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if err == nil {
+			return func() {
+				_ = lockFile.Close()
+				_ = os.Remove(lockPath)
+			}, nil
+		}
+
+		if !os.IsExist(err) {
+			return nil, err
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("timeout acquiring history lock: %s", lockPath)
+		}
+		time.Sleep(waitStep)
+	}
+}
+
+core/history/storage_test.go
+package history
+
+import (
+	"Syne/core/protocol"
+	"os"
+	"testing"
+	"time"
+)
+
+func withTempCWD(t *testing.T) {
+	t.Helper()
+	prev, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmp := t.TempDir()
+	if err := os.Chdir(tmp); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(prev) })
+}
+
+func TestSaveMessageDedupByMessageID(t *testing.T) {
+	withTempCWD(t)
+
+	msg := protocol.Message{
+		Version:   protocol.ProtocolVersion,
+		Type:      protocol.MsgChat,
+		Target:    protocol.TargetPeer,
+		MessageID: "msg-1",
+		TargetID:  "B",
+		ChatID:    "dm:A:B",
+		From:      "A",
+		Payload:   []byte("hello"),
+		Timestamp: time.Now().UnixMilli(),
+	}
+
+	if err := SaveMessage(msg); err != nil {
+		t.Fatalf("save 1: %v", err)
+	}
+	if err := SaveMessage(msg); err != nil {
+		t.Fatalf("save 2: %v", err)
+	}
+
+	items, err := LoadMessages("dm:A:B")
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected 1 item after dedup, got %d", len(items))
+	}
+	if items[0].MessageID != "msg-1" {
+		t.Fatalf("unexpected message id: %s", items[0].MessageID)
+	}
+}
+
+core/messaging/messenger.go
+package messaging
+
+import (
+	"Syne/core/protocol"
+	"Syne/core/transport"
+	"fmt"
+	"net"
+	"sync"
+)
+
+// Messenger coordinates outgoing/incoming message flow.
+type Messenger struct {
+	Peers     map[string]*transport.Peer
+	addrIndex map[string]string
+	mu        sync.RWMutex
+	Inbox     chan protocol.Message
+}
+
+func NewMessenger(peers map[string]*transport.Peer, bufSize int) *Messenger {
+	addrIndex := make(map[string]string, len(peers))
+	for id, peer := range peers {
+		if peer == nil || peer.Addr == nil {
+			continue
+		}
+		addrIndex[peer.Addr.String()] = id
+	}
+
+	return &Messenger{
+		Peers:     peers,
+		addrIndex: addrIndex,
+		Inbox:     make(chan protocol.Message, bufSize),
+	}
+}
+
+func (m *Messenger) RegisterPeer(peerID string, peer *transport.Peer) {
+	if peer == nil || peer.Addr == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.Peers[peerID] = peer
+	m.addrIndex[peer.Addr.String()] = peerID
+}
+
+func (m *Messenger) ResolvePeerIDByAddr(addr *net.TCPAddr) (string, error) {
+	if addr == nil {
+		return "", fmt.Errorf("sender address is nil")
+	}
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	id, ok := m.addrIndex[addr.String()]
+	if !ok {
+		return "", fmt.Errorf("peer not found for address: %s", addr.String())
+	}
+	return id, nil
+}
+
+core/protocol/messages.go
+package protocol
+
+import (
+	"encoding/json"
+	"fmt"
+	"strings"
+	"time"
+)
+
+type MessageType uint8
+
+const (
+	MsgJoin MessageType = iota
+	MsgJoinAck
+	MsgLeave
+	MsgChat
+	MsgDiscovery
+)
+
+type TargetType uint8
+
+const ProtocolVersion uint8 = 1
+
+const (
+	TargetPeer TargetType = iota + 1
+	TargetGroup
+	TargetBroadcast
+)
+
+type Message struct {
+	Version uint8       `json:"version"`
+	Type    MessageType `json:"type"`
+	Target  TargetType  `json:"target"`
+
+	MessageID string `json:"message_id,omitempty"`
+	HopTTL   int    `json:"ttl,omitempty"`
+	TargetID string `json:"target_id"`
+	ChatID   string `json:"chat_id"`
+	From     string `json:"from"`
+	Payload  []byte `json:"payload"`
+
+	Timestamp int64 `json:"timestamp"`
+}
+
+func (t MessageType) String() string {
+	switch t {
+	case MsgJoin:
+		return "join"
+	case MsgJoinAck:
+		return "join_ack"
+	case MsgLeave:
+		return "leave"
+	case MsgChat:
+		return "chat"
+	case MsgDiscovery:
+		return "discovery"
+	default:
+		return fmt.Sprintf("unknown(%d)", uint8(t))
+	}
+}
+
+func MarshalMessage(msg Message) ([]byte, error) {
+	return json.Marshal(msg)
+}
+
+func UnmarshalMessage(data []byte) (Message, error) {
+	var msg Message
+	if err := json.Unmarshal(data, &msg); err != nil {
+		return Message{}, err
+	}
+	return msg, nil
+}
+func NewJoin(chatID, fromID, targetID string) Message {
+	return Message{
+		Version:   ProtocolVersion,
+		Type:      MsgJoin,
+		Target:    TargetPeer,
+		ChatID:    chatID,
+		From:      fromID,
+		TargetID:  targetID,
+		Timestamp: time.Now().UnixMilli(),
+	}
+}
+func NewJoinAck(chatID, fromID, targetID string) Message {
+	return Message{
+		Version:   ProtocolVersion,
+		Type:      MsgJoinAck,
+		Target:    TargetPeer,
+		ChatID:    chatID,
+		From:      fromID,
+		TargetID:  targetID,
+		Timestamp: time.Now().UnixMilli(),
+	}
+}
+func ValidateMessage(msg Message) error {
+	if msg.Version != ProtocolVersion {
+		return fmt.Errorf("unsupported protocol version: %d", msg.Version)
+	}
+	if msg.From == "" {
+		return fmt.Errorf("from is required")
+	}
+	if msg.Target != TargetPeer && msg.Target != TargetGroup && msg.Target != TargetBroadcast {
+		return fmt.Errorf("invalid target: %d", msg.Target)
+	}
+	if msg.Target != TargetBroadcast && strings.TrimSpace(msg.TargetID) == "" {
+		return fmt.Errorf("target_id is required")
+	}
+	if strings.TrimSpace(msg.ChatID) == "" {
+		return fmt.Errorf("chat_id is required")
+	}
+	if msg.Timestamp <= 0 {
+		return fmt.Errorf("timestamp must be > 0")
+	}
+	if msg.Type == MsgChat && msg.HopTTL < 0 {
+		return fmt.Errorf("ttl must be >= 0")
+	}
+	return nil
+}
+
+core/protocol/messages_test.go
+package protocol
+
+import (
+	"testing"
+	"time"
+)
+
+func TestMarshalUnmarshalAndValidate(t *testing.T) {
+	in := Message{
+		Version:   ProtocolVersion,
+		Type:      MsgChat,
+		Target:    TargetPeer,
+		MessageID: "m1",
+		TargetID:  "B",
+		ChatID:    "dm:A:B",
+		From:      "A",
+		Payload:   []byte("ping"),
+		Timestamp: time.Now().UnixMilli(),
+	}
+
+	wire, err := MarshalMessage(in)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	out, err := UnmarshalMessage(wire)
+	if err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if err := ValidateMessage(out); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	if string(out.Payload) != "ping" || out.From != "A" || out.ChatID != "dm:A:B" {
+		t.Fatalf("unexpected decoded message: %+v", out)
+	}
+}
+
+func TestValidateMessageRejectsInvalid(t *testing.T) {
+	msg := Message{
+		Version:   ProtocolVersion,
+		Type:      MsgChat,
+		Target:    0,
+		TargetID:  "",
+		ChatID:    "",
+		From:      "",
+		Timestamp: 0,
+	}
+	if err := ValidateMessage(msg); err == nil {
+		t.Fatalf("expected validation error")
+	}
+}
+
+core/repo/repo.go
+package repo
+
+core/transport/p2p/drop.go
+package drop
+
+type StoredMessage struct {
+	Version   uint8  `json:"version"`
+	Type      uint8  `json:"type"`
+	Target    uint8  `json:"target"`
+	MessageID string `json:"message_id,omitempty"`
+	TargetID  string `json:"target_id"`
+	ChatID    string `json:"chat_id"`
+	From      string `json:"from"`
+	Payload   []byte `json:"payload"`
+	Timestamp int64  `json:"timestamp"`
+}
+
+func IsMessageForMe(msg StoredMessage, localID string) bool {
+	return msg.TargetID == localID
+}
+
+func DropNext() {
+	// hop to next peer
+}
+
+core/transport/relay.go
+package transport
+
+// RelayTransport is a placeholder for optional relay-based transport.
+type RelayTransport struct{}
+
+core/transport/tcp.go
+package transport
+
+import (
+	"fmt"
+	"io"
+	"net"
+)
+
+// Peer contains logical peer identity and current TCP endpoint.
+type Peer struct {
+	PeerID string
+	Addr   *net.TCPAddr
+}
+
+func ListenTCP(port int) (*net.TCPListener, error) {
+	addr := &net.TCPAddr{Port: port}
+	listener, err := net.ListenTCP("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	fmt.Println("Listening on port", listener.Addr().(*net.TCPAddr).Port)
+	return listener, nil
+}
+
+func SendTCP(peer *Peer, data []byte) error {
+	if peer == nil || peer.Addr == nil {
+		return fmt.Errorf("peer address is nil")
+	}
+
+	conn, err := net.DialTCP("tcp", nil, peer.Addr)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	_, err = conn.Write(data)
+	return err
+}
+
+func AcceptTCP(listener *net.TCPListener) (net.Conn, *net.TCPAddr, error) {
+	conn, err := listener.Accept()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	addr, _ := conn.RemoteAddr().(*net.TCPAddr)
+	return conn, addr, nil
+}
+
+func ReceiveTCP(conn net.Conn, maxBytes int64) ([]byte, error) {
+	defer conn.Close()
+	if maxBytes <= 0 {
+		maxBytes = 64 * 1024
+	}
+	limited := &io.LimitedReader{R: conn, N: maxBytes + 1}
+	data, err := io.ReadAll(limited)
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxBytes {
+		return nil, fmt.Errorf("payload too large: %d > %d", len(data), maxBytes)
+	}
+	return data, nil
+}
+
+func IsPortFree(port int) bool {
+	l, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+	if err != nil {
+		return false
+	}
+	_ = l.Close()
+	return true
+}
+

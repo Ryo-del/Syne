@@ -33,6 +33,7 @@ type Message struct {
 	Target  TargetType  `json:"target"`
 
 	MessageID string `json:"message_id,omitempty"`
+	HopTTL   int    `json:"ttl,omitempty"`
 	TargetID string `json:"target_id"`
 	ChatID   string `json:"chat_id"`
 	From     string `json:"from"`
@@ -109,6 +110,9 @@ func ValidateMessage(msg Message) error {
 	}
 	if msg.Timestamp <= 0 {
 		return fmt.Errorf("timestamp must be > 0")
+	}
+	if msg.Type == MsgChat && msg.HopTTL < 0 {
+		return fmt.Errorf("ttl must be >= 0")
 	}
 	return nil
 }
