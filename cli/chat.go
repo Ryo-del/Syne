@@ -167,10 +167,10 @@ func RunChat(ctx context.Context, cfg Config) error {
 					knownChats[msg.ChatID] = struct{}{}
 					stateMu.Unlock()
 					fmt.Printf("\n[system] %s joined chat %s\n> ", msg.From, msg.ChatID)
-					ack := protocol.NewJoinAck(msg.ChatID, cfg.LocalID, msg.From)
-					if err := sendAckToContact(ack); err != nil {
-						fmt.Printf("join ack send error: %v\n", err)
-					}
+						ack := protocol.NewJoinAck(msg.ChatID, cfg.LocalID, msg.From)
+						if err := sendAckToContact(ack, sender); err != nil {
+							fmt.Printf("join ack send error: %v\n", err)
+						}
 			case protocol.MsgJoinAck:
 				stateMu.Lock()
 				knownChats[msg.ChatID] = struct{}{}
@@ -415,16 +415,22 @@ func sendProtocolMessage(peer *transport.Peer, msg protocol.Message) error {
 	return nil
 }
 
-func sendAckToContact(msg protocol.Message) error {
+func sendAckToContact(msg protocol.Message, sender *net.TCPAddr) error {
 	c, err := corechat.FindContact(msg.TargetID)
-	if err != nil {
-		return fmt.Errorf("ack contact not found: %w", err)
+	if err == nil {
+		addr, err := net.ResolveTCPAddr("tcp", c.Address())
+		if err != nil {
+			return fmt.Errorf("ack resolve address: %w", err)
+		}
+		peer := &transport.Peer{PeerID: c.PeerID, Addr: addr}
+		return sendProtocolMessage(peer, msg)
 	}
-	addr, err := net.ResolveTCPAddr("tcp", c.Address())
-	if err != nil {
-		return fmt.Errorf("ack resolve address: %w", err)
+
+	// Fallback: send back to the actual sender if contact is missing.
+	if sender == nil {
+		return fmt.Errorf("ack contact not found and sender is nil: %w", err)
 	}
-	peer := &transport.Peer{PeerID: c.PeerID, Addr: addr}
+	peer := &transport.Peer{PeerID: msg.TargetID, Addr: sender}
 	return sendProtocolMessage(peer, msg)
 }
 
