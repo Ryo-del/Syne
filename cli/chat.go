@@ -298,6 +298,7 @@ func forwardToNeighbors(msg protocol.Message, sender *net.TCPAddr, neighbors map
 	}
 
 	targets := make(map[string]*transport.Peer)
+	count := 0
 	addTarget := func(peerID, addrStr string) {
 		if peerID == msg.From {
 			return
@@ -328,9 +329,13 @@ func forwardToNeighbors(msg protocol.Message, sender *net.TCPAddr, neighbors map
 	}
 
 	for _, peer := range targets {
+		count++
 		go func(p *transport.Peer, m protocol.Message) {
 			_ = sendProtocolMessage(p, m)
 		}(peer, msg)
+	}
+	if count == 0 {
+		return fmt.Errorf("no neighbors or contacts to forward")
 	}
 	return nil
 }
