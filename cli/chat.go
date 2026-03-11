@@ -117,7 +117,6 @@ func RunChat(ctx context.Context, cfg Config) error {
 	}
 
 	fmt.Printf("Chat started. local=%s, me=%s\n", listener.Addr().String(), cfg.LocalID)
-	fmt.Println("Commands: /contact add <name> <peer-id> <ip:port> | /contact rename <name-or-peer-id> <new-name> | /contact delete <name-or-peer-id> | /contact list | /chat open <name-or-peer-id> | /sendto <peer-id> <text>")
 	fmt.Println("Then type text to send into active chat. Ctrl+C to exit.")
 
 	if err := discovery.StartLANDiscovery(ctx, cfg.LocalID, cfg.LocalPort, func(peerID, addr string) {
@@ -166,22 +165,22 @@ func RunChat(ctx context.Context, cfg Config) error {
 			}
 
 			switch msg.Type {
-				case protocol.MsgJoin:
-					rateMu.Lock()
-					allowed := allowRate(rateStates, sender.IP.String(), time.Now(), 8, 16)
-					rateMu.Unlock()
-					if !allowed {
-						fmt.Printf("\n[system] rate limit exceeded for %s (join)\n> ", sender.IP.String())
-						continue
-					}
-					stateMu.Lock()
-					knownChats[msg.ChatID] = struct{}{}
-					stateMu.Unlock()
-					fmt.Printf("\n[system] %s joined chat %s\n> ", msg.From, msg.ChatID)
-						ack := protocol.NewJoinAck(msg.ChatID, cfg.LocalID, msg.From)
-						if err := sendAckToContact(ack, sender); err != nil {
-							fmt.Printf("join ack send error: %v\n", err)
-						}
+			case protocol.MsgJoin:
+				rateMu.Lock()
+				allowed := allowRate(rateStates, sender.IP.String(), time.Now(), 8, 16)
+				rateMu.Unlock()
+				if !allowed {
+					fmt.Printf("\n[system] rate limit exceeded for %s (join)\n> ", sender.IP.String())
+					continue
+				}
+				stateMu.Lock()
+				knownChats[msg.ChatID] = struct{}{}
+				stateMu.Unlock()
+				fmt.Printf("\n[system] %s joined chat %s\n> ", msg.From, msg.ChatID)
+				ack := protocol.NewJoinAck(msg.ChatID, cfg.LocalID, msg.From)
+				if err := sendAckToContact(ack, sender); err != nil {
+					fmt.Printf("join ack send error: %v\n", err)
+				}
 			case protocol.MsgJoinAck:
 				stateMu.Lock()
 				knownChats[msg.ChatID] = struct{}{}
@@ -205,23 +204,23 @@ func RunChat(ctx context.Context, cfg Config) error {
 					continue
 				}
 
-					if msg.TargetID == cfg.LocalID {
-						hopsTaken := defaultHopTTL - msg.HopTTL
-						fmt.Printf("\n<- %s [%s] (via %d hops, last relay: %s): %s\n> ", msg.From, msg.ChatID, hopsTaken, sender.IP.String(), string(msg.Payload))
-						if err := history.SaveMessage(msg); err != nil {
-							fmt.Printf("history save error: %v\n", err)
+				if msg.TargetID == cfg.LocalID {
+					hopsTaken := defaultHopTTL - msg.HopTTL
+					fmt.Printf("\n<- %s [%s] (via %d hops, last relay: %s): %s\n> ", msg.From, msg.ChatID, hopsTaken, sender.IP.String(), string(msg.Payload))
+					if err := history.SaveMessage(msg); err != nil {
+						fmt.Printf("history save error: %v\n", err)
 					}
 				} else {
-						if msg.HopTTL <= 1 {
-							fmt.Printf("\n[system] TTL expired for msg %s from %s\n> ", msg.MessageID, msg.From)
-							continue
-						}
-						msg.HopTTL--
-						fmt.Printf("\n[system] Relay: forwarding msg from %s to %s (TTL: %d)\n> ", msg.From, msg.TargetID, msg.HopTTL)
-						if err := forwardToNeighbors(msg, sender, neighbors, &neighborsMu); err != nil {
-							fmt.Printf("\n[system] forward error: %v\n> ", err)
-						}
+					if msg.HopTTL <= 1 {
+						fmt.Printf("\n[system] TTL expired for msg %s from %s\n> ", msg.MessageID, msg.From)
+						continue
 					}
+					msg.HopTTL--
+					fmt.Printf("\n[system] Relay: forwarding msg from %s to %s (TTL: %d)\n> ", msg.From, msg.TargetID, msg.HopTTL)
+					if err := forwardToNeighbors(msg, sender, neighbors, &neighborsMu); err != nil {
+						fmt.Printf("\n[system] forward error: %v\n> ", err)
+					}
+				}
 			default:
 				fmt.Printf("\n[system] %s [%s] from %s\n> ", msg.Type.String(), msg.ChatID, msg.From)
 			}
@@ -253,11 +252,11 @@ func RunChat(ctx context.Context, cfg Config) error {
 			continue
 		}
 		if strings.HasPrefix(text, "/") {
-				if err := handleCommand(text, openChat, cfg.LocalID, neighbors, &neighborsMu); err != nil {
-					fmt.Printf("command error: %v\n", err)
-				}
-				continue
+			if err := handleCommand(text, openChat, cfg.LocalID, neighbors, &neighborsMu); err != nil {
+				fmt.Printf("command error: %v\n", err)
 			}
+			continue
+		}
 
 		stateMu.RLock()
 		peer := activePeer
@@ -365,7 +364,9 @@ func handleCommand(input string, openChat func(peerID, peerAddr string) error, l
 	}
 
 	switch parts[0] {
-
+	case "/help":
+		fmt.Println("Commands: /contact add <name> <peer-id> <ip:port> | /contact rename <name-or-peer-id> <new-name> | /contact delete <name-or-peer-id> | /contact list | /chat open <name-or-peer-id> | /sendto <peer-id> <text>")
+		return nil
 	case "/contact":
 		if len(parts) < 2 {
 			return fmt.Errorf("usage: /contact add <name> <peer-id> <ip:port> | /contact list")
