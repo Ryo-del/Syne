@@ -17,5 +17,4 @@ func IsMessageForMe(msg StoredMessage, localID string) bool {
 }
 
 func DropNext() {
-	// hop to next peer
 }

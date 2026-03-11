@@ -2,6 +2,7 @@ package cli
 
 import (
 	corechat "Syne/core/chat"
+	"Syne/core/discovery"
 	"Syne/core/history"
 	"Syne/core/protocol"
 	"Syne/core/transport"
@@ -76,6 +77,8 @@ func RunChat(ctx context.Context, cfg Config) error {
 	seenMessages := make(map[string]time.Time)
 	rateStates := make(map[string]*rateState)
 	var rateMu sync.Mutex
+	neighbors := make(map[string]string)
+	var neighborsMu sync.RWMutex
 
 	openChat := func(peerID, peerAddr string) error {
 		peerID = strings.TrimSpace(peerID)
@@ -114,8 +117,16 @@ func RunChat(ctx context.Context, cfg Config) error {
 	}
 
 	fmt.Printf("Chat started. local=%s, me=%s\n", listener.Addr().String(), cfg.LocalID)
-	fmt.Println("Commands: /contact add <name> <peer-id> <ip:port> | /contact rename <name-or-peer-id> <new-name> | /contact delete <name-or-peer-id> | /contact list | /chat open <name-or-peer-id>")
+	fmt.Println("Commands: /contact add <name> <peer-id> <ip:port> | /contact rename <name-or-peer-id> <new-name> | /contact delete <name-or-peer-id> | /contact list | /chat open <name-or-peer-id> | /sendto <peer-id> <text>")
 	fmt.Println("Then type text to send into active chat. Ctrl+C to exit.")
+
+	if err := discovery.StartLANDiscovery(ctx, cfg.LocalID, cfg.LocalPort, func(peerID, addr string) {
+		neighborsMu.Lock()
+		neighbors[peerID] = addr
+		neighborsMu.Unlock()
+	}); err != nil {
+		fmt.Printf("discovery error: %v\n", err)
+	}
 
 	if strings.TrimSpace(cfg.PeerID) != "" && strings.TrimSpace(cfg.PeerAddr) != "" {
 		if err := openChat(cfg.PeerID, cfg.PeerAddr); err != nil {
@@ -194,23 +205,23 @@ func RunChat(ctx context.Context, cfg Config) error {
 					continue
 				}
 
-				if msg.TargetID == cfg.LocalID {
-					hopsTaken := defaultHopTTL - msg.HopTTL
-					fmt.Printf("\n<- %s [%s] (via %d hops, last relay: %s): %s\n> ", msg.From, msg.ChatID, hopsTaken, sender.IP.String(), string(msg.Payload))
-					if err := history.SaveMessage(msg); err != nil {
-						fmt.Printf("history save error: %v\n", err)
+					if msg.TargetID == cfg.LocalID {
+						hopsTaken := defaultHopTTL - msg.HopTTL
+						fmt.Printf("\n<- %s [%s] (via %d hops, last relay: %s): %s\n> ", msg.From, msg.ChatID, hopsTaken, sender.IP.String(), string(msg.Payload))
+						if err := history.SaveMessage(msg); err != nil {
+							fmt.Printf("history save error: %v\n", err)
 					}
 				} else {
-					if msg.HopTTL <= 1 {
-						fmt.Printf("\n[system] TTL expired for msg %s from %s\n> ", msg.MessageID, msg.From)
-						continue
+						if msg.HopTTL <= 1 {
+							fmt.Printf("\n[system] TTL expired for msg %s from %s\n> ", msg.MessageID, msg.From)
+							continue
+						}
+						msg.HopTTL--
+						fmt.Printf("\n[system] Relay: forwarding msg from %s to %s (TTL: %d)\n> ", msg.From, msg.TargetID, msg.HopTTL)
+						if err := forwardToNeighbors(msg, sender, neighbors, &neighborsMu); err != nil {
+							fmt.Printf("\n[system] forward error: %v\n> ", err)
+						}
 					}
-					msg.HopTTL--
-					fmt.Printf("\n[system] Relay: forwarding msg from %s to %s (TTL: %d)\n> ", msg.From, msg.TargetID, msg.HopTTL)
-					if err := forwardToNeighbors(msg, sender); err != nil {
-						fmt.Printf("\n[system] forward error: %v\n> ", err)
-					}
-				}
 			default:
 				fmt.Printf("\n[system] %s [%s] from %s\n> ", msg.Type.String(), msg.ChatID, msg.From)
 			}
@@ -242,11 +253,11 @@ func RunChat(ctx context.Context, cfg Config) error {
 			continue
 		}
 		if strings.HasPrefix(text, "/") {
-			if err := handleCommand(text, openChat); err != nil {
-				fmt.Printf("command error: %v\n", err)
+				if err := handleCommand(text, openChat, cfg.LocalID, neighbors, &neighborsMu); err != nil {
+					fmt.Printf("command error: %v\n", err)
+				}
+				continue
 			}
-			continue
-		}
 
 		stateMu.RLock()
 		peer := activePeer
@@ -280,24 +291,43 @@ func RunChat(ctx context.Context, cfg Config) error {
 	}
 }
 
-func forwardToNeighbors(msg protocol.Message, sender *net.TCPAddr) error {
+func forwardToNeighbors(msg protocol.Message, sender *net.TCPAddr, neighbors map[string]string, neighborsMu *sync.RWMutex) error {
 	contacts, err := corechat.ListContacts()
 	if err != nil {
 		return err
 	}
-	for _, c := range contacts {
-		if c.PeerID == msg.From {
-			continue
+
+	targets := make(map[string]*transport.Peer)
+	addTarget := func(peerID, addrStr string) {
+		if peerID == msg.From {
+			return
 		}
-		addrStr := c.Address()
 		if sender != nil && sender.String() == addrStr {
-			continue
+			return
+		}
+		if _, ok := targets[addrStr]; ok {
+			return
 		}
 		addr, err := net.ResolveTCPAddr("tcp", addrStr)
 		if err != nil {
-			continue
+			return
 		}
-		peer := &transport.Peer{PeerID: c.PeerID, Addr: addr}
+		targets[addrStr] = &transport.Peer{PeerID: peerID, Addr: addr}
+	}
+
+	for _, c := range contacts {
+		addTarget(c.PeerID, c.Address())
+	}
+
+	if neighborsMu != nil {
+		neighborsMu.RLock()
+		for peerID, addrStr := range neighbors {
+			addTarget(peerID, addrStr)
+		}
+		neighborsMu.RUnlock()
+	}
+
+	for _, peer := range targets {
 		go func(p *transport.Peer, m protocol.Message) {
 			_ = sendProtocolMessage(p, m)
 		}(peer, msg)
@@ -323,7 +353,7 @@ func isSeen(cache map[string]time.Time, id string, now time.Time, ttl time.Durat
 	return false
 }
 
-func handleCommand(input string, openChat func(peerID, peerAddr string) error) error {
+func handleCommand(input string, openChat func(peerID, peerAddr string) error, localID string, neighbors map[string]string, neighborsMu *sync.RWMutex) error {
 	parts := strings.Fields(input)
 	if len(parts) == 0 {
 		return nil
@@ -395,6 +425,31 @@ func handleCommand(input string, openChat func(peerID, peerAddr string) error) e
 			return err
 		}
 		return openChat(c.PeerID, c.Address())
+	case "/sendto":
+		if len(parts) < 3 {
+			return fmt.Errorf("usage: /sendto <peer-id> <text>")
+		}
+		targetID := parts[1]
+		text := strings.Join(parts[2:], " ")
+		if strings.TrimSpace(text) == "" {
+			return fmt.Errorf("text is required")
+		}
+		msg := protocol.Message{
+			Version:   protocol.ProtocolVersion,
+			Type:      protocol.MsgChat,
+			Target:    protocol.TargetPeer,
+			MessageID: uuid.NewString(),
+			HopTTL:    defaultHopTTL,
+			TargetID:  targetID,
+			ChatID:    privateChatID(localID, targetID),
+			From:      localID,
+			Payload:   []byte(text),
+			Timestamp: time.Now().UnixMilli(),
+		}
+		if err := forwardToNeighbors(msg, nil, neighbors, neighborsMu); err != nil {
+			return err
+		}
+		return nil
 	default:
 		return fmt.Errorf("unknown command")
 	}
