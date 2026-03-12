@@ -86,6 +86,11 @@ func RunChat(ctx context.Context, cfg Config) error {
 		if peerID == "" || peerAddr == "" {
 			return fmt.Errorf("peer-id and peer-addr are required")
 		}
+		if blocked, err := corechat.IsBlocked(peerID); err != nil {
+			return err
+		} else if blocked {
+			return fmt.Errorf("peer is blocked: %s", peerID)
+		}
 		addr, err := net.ResolveTCPAddr("tcp", peerAddr)
 		if err != nil {
 			return fmt.Errorf("resolve peer address: %w", err)
@@ -117,6 +122,7 @@ func RunChat(ctx context.Context, cfg Config) error {
 	}
 
 	fmt.Printf("Chat started. local=%s, me=%s\n", listener.Addr().String(), cfg.LocalID)
+	fmt.Println("/help - show commands")
 	fmt.Println("Then type text to send into active chat. Ctrl+C to exit.")
 
 	if err := discovery.StartLANDiscovery(ctx, cfg.LocalID, cfg.LocalPort, func(peerID, addr string) {
@@ -166,6 +172,13 @@ func RunChat(ctx context.Context, cfg Config) error {
 
 			switch msg.Type {
 			case protocol.MsgJoin:
+				if blocked, err := corechat.IsBlocked(msg.From); err != nil {
+					fmt.Printf("\n[system] blocklist check error: %v\n> ", err)
+					continue
+				} else if blocked {
+					fmt.Printf("\n[system] blocked peer %s tried to join (dropped)\n> ", msg.From)
+					continue
+				}
 				rateMu.Lock()
 				allowed := allowRate(rateStates, sender.IP.String(), time.Now(), 8, 16)
 				rateMu.Unlock()
@@ -182,6 +195,13 @@ func RunChat(ctx context.Context, cfg Config) error {
 					fmt.Printf("join ack send error: %v\n", err)
 				}
 			case protocol.MsgJoinAck:
+				if blocked, err := corechat.IsBlocked(msg.From); err != nil {
+					fmt.Printf("\n[system] blocklist check error: %v\n> ", err)
+					continue
+				} else if blocked {
+					fmt.Printf("\n[system] blocked peer %s join-ack (dropped)\n> ", msg.From)
+					continue
+				}
 				stateMu.Lock()
 				knownChats[msg.ChatID] = struct{}{}
 				stateMu.Unlock()
@@ -189,6 +209,13 @@ func RunChat(ctx context.Context, cfg Config) error {
 			case protocol.MsgChat:
 				if msg.MessageID == "" {
 					fmt.Printf("\n[system] missing message_id from %s (dropped)\n> ", msg.From)
+					continue
+				}
+				if blocked, err := corechat.IsBlocked(msg.From); err != nil {
+					fmt.Printf("\n[system] blocklist check error: %v\n> ", err)
+					continue
+				} else if blocked {
+					fmt.Printf("\n[system] message from blocked peer %s (dropped)\n> ", msg.From)
 					continue
 				}
 
@@ -264,6 +291,13 @@ func RunChat(ctx context.Context, cfg Config) error {
 		stateMu.RUnlock()
 		if peer == nil || chatID == "" {
 			fmt.Println("no active chat. Use /chat open <name-or-peer-id> first")
+			continue
+		}
+		if blocked, err := corechat.IsBlocked(peer.PeerID); err != nil {
+			fmt.Printf("blocklist check error: %v\n", err)
+			continue
+		} else if blocked {
+			fmt.Printf("[system] can't send: peer is blocked: %s\n", peer.PeerID)
 			continue
 		}
 
@@ -365,7 +399,15 @@ func handleCommand(input string, openChat func(peerID, peerAddr string) error, l
 
 	switch parts[0] {
 	case "/help":
-		fmt.Println("Commands: /contact add <name> <peer-id> <ip:port> | /contact rename <name-or-peer-id> <new-name> | /contact delete <name-or-peer-id> | /contact list | /chat open <name-or-peer-id> | /sendto <peer-id> <text>")
+		fmt.Println("/contact add <name> <peer-id> <ip:port>      - добавить контакт")
+		fmt.Println("/contact rename <name-or-peer-id> <new-name>  - переименовать контакт")
+		fmt.Println("/contact delete <name-or-peer-id>             - удалить контакт")
+		fmt.Println("/contact list                                 - показать список контактов")
+		fmt.Println("/block add <name-or-peer-id> [reason]          - добавить в ЧС")
+		fmt.Println("/block remove <name-or-peer-id>               - убрать из ЧС")
+		fmt.Println("/block list                                   - показать ЧС")
+		fmt.Println("/chat open <name-or-peer-id>                  - открыть чат с контактом")
+		fmt.Println("/sendto <peer-id> <text>                      - отправить сообщение выбранному peer")
 		return nil
 	case "/contact":
 		if len(parts) < 2 {
@@ -436,6 +478,11 @@ func handleCommand(input string, openChat func(peerID, peerAddr string) error, l
 			return fmt.Errorf("usage: /sendto <peer-id> <text>")
 		}
 		targetID := parts[1]
+		if blocked, err := corechat.IsBlocked(targetID); err != nil {
+			return err
+		} else if blocked {
+			return fmt.Errorf("peer is blocked: %s", targetID)
+		}
 		text := strings.Join(parts[2:], " ")
 		if strings.TrimSpace(text) == "" {
 			return fmt.Errorf("text is required")
@@ -456,6 +503,49 @@ func handleCommand(input string, openChat func(peerID, peerAddr string) error, l
 			return err
 		}
 		return nil
+	case "/block":
+		if len(parts) < 2 {
+			return fmt.Errorf("usage: /block add <name-or-peer-id> [reason] | /block remove <name-or-peer-id> | /block list")
+		}
+		switch parts[1] {
+		case "add":
+			if len(parts) < 3 {
+				return fmt.Errorf("usage: /block add <name-or-peer-id> [reason]")
+			}
+			reason := ""
+			if len(parts) > 3 {
+				reason = strings.Join(parts[3:], " ")
+			}
+			return corechat.AddBlocked(parts[2], reason)
+		case "remove":
+			if len(parts) != 3 {
+				return fmt.Errorf("usage: /block remove <name-or-peer-id>")
+			}
+			return corechat.RemoveBlocked(parts[2])
+		case "list":
+			items, err := corechat.ListBlocked()
+			if err != nil {
+				return err
+			}
+			if len(items) == 0 {
+				fmt.Println("[system] blocklist is empty")
+				return nil
+			}
+			for _, it := range items {
+				label := it.PeerID
+				if strings.TrimSpace(it.Name) != "" {
+					label = it.Name + " | " + it.PeerID
+				}
+				if strings.TrimSpace(it.Reason) != "" {
+					fmt.Printf("[blocked] %s | reason: %s\n", label, it.Reason)
+				} else {
+					fmt.Printf("[blocked] %s\n", label)
+				}
+			}
+			return nil
+		default:
+			return fmt.Errorf("unknown /block command")
+		}
 	default:
 		return fmt.Errorf("unknown command")
 	}
