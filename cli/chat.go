@@ -2,12 +2,14 @@ package cli
 
 import (
 	corechat "Syne/core/chat"
+	"Syne/core/crypto"
 	"Syne/core/discovery"
 	"Syne/core/history"
 	"Syne/core/protocol"
 	"Syne/core/transport"
 	"bufio"
 	"context"
+	"crypto/ecdh"
 	"errors"
 	"fmt"
 	"io"
@@ -69,6 +71,17 @@ func RunChat(ctx context.Context, cfg Config) error {
 	}
 	defer listener.Close()
 
+	identityPriv, err := crypto.LoadOrCreateIdentityKey()
+	if err != nil {
+		return fmt.Errorf("load identity key: %w", err)
+	}
+	identityPub, err := crypto.PublicKeyBytes(identityPriv)
+	if err != nil {
+		return fmt.Errorf("identity public key: %w", err)
+	}
+	fmt.Println("[system] encryption enabled (X25519 ECDH + HKDF)")
+	sharedKey := []byte(nil) // kept for handleCommand signature; not used with ECDH
+
 	reader := bufio.NewReader(os.Stdin)
 	var stateMu sync.RWMutex
 	var activePeer *transport.Peer
@@ -79,6 +92,8 @@ func RunChat(ctx context.Context, cfg Config) error {
 	var rateMu sync.Mutex
 	neighbors := make(map[string]string)
 	var neighborsMu sync.RWMutex
+	peerPubs := make(map[string]*ecdh.PublicKey)
+	var peerPubsMu sync.RWMutex
 
 	openChat := func(peerID, peerAddr string) error {
 		peerID = strings.TrimSpace(peerID)
@@ -115,6 +130,7 @@ func RunChat(ctx context.Context, cfg Config) error {
 		}
 
 		join := protocol.NewJoin(chatID, cfg.LocalID, peerID)
+		join.FromPub = identityPub
 		if err := sendProtocolMessage(peer, join); err != nil {
 			fmt.Printf("join send error: %v\n", err)
 		}
@@ -189,8 +205,18 @@ func RunChat(ctx context.Context, cfg Config) error {
 				stateMu.Lock()
 				knownChats[msg.ChatID] = struct{}{}
 				stateMu.Unlock()
+
+				if len(msg.FromPub) == crypto.X25519PublicKeySize {
+					if pub, err := crypto.ParseX25519PublicKey(msg.FromPub); err == nil {
+						peerPubsMu.Lock()
+						peerPubs[msg.From] = pub
+						peerPubsMu.Unlock()
+					}
+				}
+
 				fmt.Printf("\n[system] %s joined chat %s\n> ", msg.From, msg.ChatID)
 				ack := protocol.NewJoinAck(msg.ChatID, cfg.LocalID, msg.From)
+				ack.FromPub = identityPub
 				if err := sendAckToContact(ack, sender); err != nil {
 					fmt.Printf("join ack send error: %v\n", err)
 				}
@@ -205,6 +231,15 @@ func RunChat(ctx context.Context, cfg Config) error {
 				stateMu.Lock()
 				knownChats[msg.ChatID] = struct{}{}
 				stateMu.Unlock()
+
+				if len(msg.FromPub) == crypto.X25519PublicKeySize {
+					if pub, err := crypto.ParseX25519PublicKey(msg.FromPub); err == nil {
+						peerPubsMu.Lock()
+						peerPubs[msg.From] = pub
+						peerPubsMu.Unlock()
+					}
+				}
+
 				fmt.Printf("\n[system] %s acknowledged join for %s\n> ", msg.From, msg.ChatID)
 			case protocol.MsgChat:
 				if msg.MessageID == "" {
@@ -232,8 +267,30 @@ func RunChat(ctx context.Context, cfg Config) error {
 				}
 
 				if msg.TargetID == cfg.LocalID {
+					payload := msg.Payload
+					if len(msg.Nonce) > 0 {
+						peerPubsMu.RLock()
+						remotePub := peerPubs[msg.From]
+						peerPubsMu.RUnlock()
+						if remotePub == nil {
+							fmt.Printf("\n<- %s [%s]: [decrypt failed: missing peer pubkey]\n> ", msg.From, msg.ChatID)
+							continue
+						}
+						key, err := crypto.DeriveChatKey(identityPriv, remotePub, msg.ChatID)
+						if err != nil {
+							fmt.Printf("\n<- %s [%s]: [decrypt failed]\n> ", msg.From, msg.ChatID)
+							continue
+						}
+						plain, err := crypto.DecryptPayload(key, msg.Nonce, msg.Payload)
+						if err != nil {
+							fmt.Printf("\n<- %s [%s]: [decrypt failed]\n> ", msg.From, msg.ChatID)
+							continue
+						}
+						payload = plain
+						msg.Payload = plain
+					}
 					hopsTaken := defaultHopTTL - msg.HopTTL
-					fmt.Printf("\n<- %s [%s] (via %d hops, last relay: %s): %s\n> ", msg.From, msg.ChatID, hopsTaken, sender.IP.String(), string(msg.Payload))
+					fmt.Printf("\n<- %s [%s] (via %d hops, last relay: %s): %s\n> ", msg.From, msg.ChatID, hopsTaken, sender.IP.String(), string(payload))
 					if err := history.SaveMessage(msg); err != nil {
 						fmt.Printf("history save error: %v\n", err)
 					}
@@ -279,7 +336,7 @@ func RunChat(ctx context.Context, cfg Config) error {
 			continue
 		}
 		if strings.HasPrefix(text, "/") {
-			if err := handleCommand(text, openChat, cfg.LocalID, neighbors, &neighborsMu); err != nil {
+			if err := handleCommand(text, openChat, cfg.LocalID, neighbors, &neighborsMu, sharedKey); err != nil {
 				fmt.Printf("command error: %v\n", err)
 			}
 			continue
@@ -313,13 +370,31 @@ func RunChat(ctx context.Context, cfg Config) error {
 			Payload:   []byte(text),
 			Timestamp: time.Now().UnixMilli(),
 		}
+		if err := history.SaveMessage(out); err != nil {
+			fmt.Printf("history save (outgoing) error: %v\n", err)
+		}
+
+		peerPubsMu.RLock()
+		remotePub := peerPubs[peer.PeerID]
+		peerPubsMu.RUnlock()
+		if remotePub != nil {
+			key, err := crypto.DeriveChatKey(identityPriv, remotePub, out.ChatID)
+			if err != nil {
+				fmt.Printf("key derive error: %v\n", err)
+				continue
+			}
+			cipher, nonce, err := crypto.EncryptPayload(key, out.Payload)
+			if err != nil {
+				fmt.Printf("encrypt error: %v\n", err)
+				continue
+			}
+			out.Payload = cipher
+			out.Nonce = nonce
+		}
 
 		if err := sendProtocolMessage(peer, out); err != nil {
 			fmt.Printf("send error: %v\n", err)
 			continue
-		}
-		if err := history.SaveMessage(out); err != nil {
-			fmt.Printf("history save (outgoing) error: %v\n", err)
 		}
 	}
 }
@@ -391,7 +466,7 @@ func isSeen(cache map[string]time.Time, id string, now time.Time, ttl time.Durat
 	return false
 }
 
-func handleCommand(input string, openChat func(peerID, peerAddr string) error, localID string, neighbors map[string]string, neighborsMu *sync.RWMutex) error {
+func handleCommand(input string, openChat func(peerID, peerAddr string) error, localID string, neighbors map[string]string, neighborsMu *sync.RWMutex, sharedKey []byte) error {
 	parts := strings.Fields(input)
 	if len(parts) == 0 {
 		return nil
