@@ -79,7 +79,6 @@ func RunChat(ctx context.Context, cfg Config) error {
 	if err != nil {
 		return fmt.Errorf("identity public key: %w", err)
 	}
-	fmt.Println("[system] encryption enabled (X25519 ECDH + HKDF)")
 	sharedKey := []byte(nil) // kept for handleCommand signature; not used with ECDH
 
 	reader := bufio.NewReader(os.Stdin)
@@ -136,9 +135,7 @@ func RunChat(ctx context.Context, cfg Config) error {
 		}
 		return nil
 	}
-
-	fmt.Printf("Chat started. local=%s, me=%s\n", listener.Addr().String(), cfg.LocalID)
-	fmt.Println("/help - show commands")
+	fmt.Print("\n/help - show commands\n\n")
 	fmt.Println("Then type text to send into active chat. Ctrl+C to exit.")
 
 	if err := discovery.StartLANDiscovery(ctx, cfg.LocalID, cfg.LocalPort, func(peerID, addr string) {

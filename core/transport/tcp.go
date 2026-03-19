@@ -18,7 +18,6 @@ func ListenTCP(port int) (*net.TCPListener, error) {
 	if err != nil {
 		return nil, err
 	}
-	fmt.Println("Listening on port", listener.Addr().(*net.TCPAddr).Port)
 	return listener, nil
 }
 

@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"os"
+
 	"path/filepath"
 	"strings"
 )
@@ -15,6 +16,10 @@ type Contact struct {
 	PeerID string `json:"peer_id"`
 	IP     string `json:"ip"`
 	Port   string `json:"port"`
+}
+
+type UserData struct {
+	ID string `json:"ID"`
 }
 
 func (c Contact) Address() string {
@@ -44,6 +49,47 @@ func DeleteContact(query string) error {
 	}
 	contacts = append(contacts[:foundIndex], contacts[foundIndex+1:]...)
 	return writeContacts(contacts)
+}
+
+func SaveUserData(id string) error {
+	path, err := UserDataFilePath()
+	if err != nil {
+		return err
+	}
+
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	data := UserData{ID: id}
+
+	return json.NewEncoder(file).Encode(data)
+}
+
+func GetUserID() (string, error) {
+	path, err := UserDataFilePath()
+	if err != nil {
+		return "", err
+	}
+
+	file, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", nil // Файла нет — это не ошибка, просто ID еще не создан
+		}
+		return "", err
+	}
+	defer file.Close()
+
+	var data UserData
+	err = json.NewDecoder(file).Decode(&data)
+	if err != nil {
+		return "", nil
+	}
+
+	return data.ID, nil
 }
 func RenameContact(query, newName string) error {
 	query = strings.TrimSpace(query)
@@ -203,4 +249,11 @@ func ContactFilePath() (string, error) {
 		return "", err
 	}
 	return filepath.Join(contactsDir, "contacts.jsonl"), nil
+}
+func UserDataFilePath() (string, error) {
+	contactsDir := filepath.Join("data", "UserData")
+	if err := os.MkdirAll(contactsDir, 0o755); err != nil {
+		return "", err
+	}
+	return filepath.Join(contactsDir, "UserData.jsonl"), nil
 }

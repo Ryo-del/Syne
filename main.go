@@ -2,6 +2,7 @@ package main
 
 import (
 	"Syne/cli"
+	"Syne/core/chat"
 	"Syne/core/transport"
 
 	"context"
@@ -34,9 +35,23 @@ func main() {
 	flag.StringVar(&PeerID, "peer-id", "peer", "Peer ID to chat with")
 	flag.StringVar(&PeerAddr, "peer-addr", "", "Peer address (IP:port)")
 	flag.Parse()
+	existingID, _ := chat.GetUserID()
+	if ID == "" && existingID == "" {
+		fmt.Print("Enter your id: ")
+		fmt.Scan(&ID)
 
-	if ID == "" {
-		ID = uuid.NewString()
+		if ID == "" {
+
+			ID = uuid.NewString()
+			fmt.Println("Generated auto-ID:", ID)
+		}
+
+		err := chat.SaveUserData(ID)
+		if err != nil {
+			fmt.Println("Error saving ID:", err)
+		}
+	} else if ID == "" {
+		ID = existingID
 	}
 
 	port := Port
