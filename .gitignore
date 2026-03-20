@@ -1,3 +1,19 @@
 .gocache/
 .gocache_local/
 data/
+
+# macOS
+.DS_Store
+
+# Frontend / Vite
+frontend/node_modules/
+frontend/dist/
+frontend/.cache/
+
+# Tauri / Rust
+frontend/src-tauri/target/
+frontend/src-tauri/gen/
+
+# Bundled sidecars
+frontend/src-tauri/binaries/*
+!frontend/src-tauri/binaries/.gitkeep

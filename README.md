@@ -2,7 +2,7 @@
 
 Syne — лёгкий **P2P-мессенджер для локальной сети** (без интернета): пиры автоматически обнаруживают друг друга по LAN и обмениваются сообщениями напрямую по TCP.
 
-Сейчас репозиторий содержит **Go-core + CLI для ручного тестирования**. UI (Tauri/React) предполагается сверху, но не входит в текущий код.
+Сейчас репозиторий содержит **Go-core + CLI для ручного тестирования** и новый desktop UI в `frontend/` на **Tauri + React**, который работает через локальный Go bridge API.
 
 ## Возможности (текущее состояние)
 
@@ -94,3 +94,71 @@ cd .\Syne-main
 
 - `ARCHITECTURE.md` — компоненты и потоки данных
 - `docs/DEV_FUNCTIONS.md` — описание каждой функции в `core/` (кроме `cli/`)
+
+## Frontend
+
+Desktop UI лежит в `frontend/`.
+
+Что нужно для запуска:
+
+- Go
+- Node.js / npm
+- Rust toolchain (для Tauri)
+
+Go bridge API можно запустить отдельно:
+
+```bash
+go run ./cmd/syne-ui-api
+```
+
+Web UI в dev-режиме:
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+Tauri desktop:
+
+```bash
+cd frontend
+npm install
+npm run tauri:dev
+```
+
+## Release Build
+
+Для standalone desktop-сборки фронтенд использует Go backend как `sidecar`.
+На целевой машине пользователя не нужны `Go`, `Node.js`, `npm` или `cargo`.
+
+Сборка релиза:
+
+```bash
+cd frontend
+npm install
+npm run tauri:build
+```
+
+Что происходит:
+
+- собирается web frontend
+- собирается Go binary `syne-ui-api`
+- binary кладётся в `src-tauri/binaries/` с суффиксом платформы
+- Tauri бандлит этот binary внутрь приложения
+
+Важно:
+
+- Windows `.exe` / `.msi` нормально собирать на Windows runner или Windows машине
+- на macOS вы обычно собираете `.app` / `.dmg`, а не Windows `.exe`
+- для cross-target сборки sidecar можно задать `SIDECAR_TARGET_TRIPLE`
+
+Пример:
+
+```bash
+cd frontend
+SIDECAR_TARGET_TRIPLE=x86_64-pc-windows-msvc npm run build:sidecar
+```
+
+Windows `.exe` удобнее собирать на Windows машине или Windows CI runner.
+В репозитории есть стартовый workflow GitHub Actions: `.github/workflows/windows-build.yml`.
