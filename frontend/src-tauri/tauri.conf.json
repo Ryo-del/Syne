@@ -11,7 +11,11 @@
   },
   "bundle": {
     "active": true,
-    "externalBin": ["binaries/syne-ui-api"]
+    "externalBin": ["binaries/syne-ui-api"],
+    "icon": [
+      "icons/icon.png",
+      "icons/icon.ico"
+    ]
   },
   "app": {
     "windows": [
