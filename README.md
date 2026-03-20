@@ -1,125 +1,51 @@
 ## Syne
 
-Syne — лёгкий **P2P-мессенджер для локальной сети** (без интернета): пиры автоматически обнаруживают друг друга по LAN и обмениваются сообщениями напрямую по TCP.
+Syne — это desktop **LAN-мессенджер**: пиры находят друг друга внутри локальной сети и обмениваются сообщениями напрямую, без центрального сервера.
 
-Сейчас репозиторий содержит **Go-core + CLI для ручного тестирования** и новый desktop UI в `frontend/` на **Tauri + React**, который работает через локальный Go bridge API.
+Текущий стек приложения:
 
-## Возможности (текущее состояние)
+- **Desktop UI**: `Tauri + React`
+- **Локальный backend**: `Go`
+- **Сетевая модель**: `P2P over LAN`
 
-- **LAN discovery**: UDP broadcast-анонсы присутствия.
-- **Сообщения**: TCP, JSON-протокол с валидацией.
-- **История**: локальная JSONL-история по `chat_id`, с дедупликацией по `message_id`.
-- **Контакты**: локальный список контактов (JSONL).
-- **Чёрный список (ЧС)**: блокировка пиров (JSONL), блокирует входящие `join/chat` и исходящие отправки.
-- **Relay/Server**: пока заглушки/план (см. `ARCHITECTURE.md`).
+Проект теперь **UI-first**. Старый терминальный чат остался только как legacy/debug путь и больше не считается основным способом запуска.
 
-## Быстрый старт
+## Что запускать
 
-Требования:
+Для обычного использования запускается desktop-приложение:
 
-- Go (1.20+ будет достаточно для текущего кода)
+- на macOS: `Syne.app`
+- на Windows: установщик или bundle из GitHub Actions
 
-### Linux/macOS (go run)
+Обычному пользователю **не нужны**:
 
-Запуск:
+- `Go`
+- `Node.js`
+- `npm`
+- `cargo`
 
-```bash
-go run . -port 3000 -id alice
-```
+Эти инструменты нужны только для разработки и сборки релизов.
 
-Во втором терминале:
+## Текущее состояние
 
-```bash
-go run . -port 3001 -id bob
-```
+Что уже работает:
 
-Обе копии будут вещать себя в локальной сети и “видеть” соседей.
+- обнаружение пиров в LAN
+- доставка личных сообщений по TCP
+- локальная история чатов
+- контакты
+- блоклист
+- desktop UI
 
-### Windows (готовый бинарь)
+Что пока не в фокусе:
 
-Из директории, где лежит `syne.exe` (например, `Syne-main`):
+- relay/server режим
+- полноценная production crypto-модель
+- подписанные installers / notarized releases
 
-```powershell
-cd .\Syne-main
-.\syne.exe --id Bob --port 3000
-```
+## macOS
 
-Во втором окне:
-
-```powershell
-.\syne.exe --id Alice --port 3001
-```
-
-## Флаги
-
-- `-id`: ваш peer id (если пусто — генерируется UUID)
-- `-port`: локальный TCP порт (если занят — возьмётся следующий свободный)
-- `-peer-id`: (опционально) peer id собеседника для авто-открытия чата
-- `-peer-addr`: (опционально) адрес собеседника `ip:port` для авто-открытия чата
-
-## Команды в CLI
-
-Откройте справку:
-
-- `/help`
-
-Контакты:
-
-- `/contact add <name> <peer-id> <ip:port>`
-- `/contact rename <name-or-peer-id> <new-name>`
-- `/contact delete <name-or-peer-id>`
-- `/contact list`
-
-Чаты/сообщения:
-
-- `/chat open <name-or-peer-id>` — сделать чат активным
-- просто печатайте текст — он уйдёт в активный чат
-- `/sendto <peer-id> <text>` — отправка без открытия чата (через форвардинг по соседям/контактам)
-
-Чёрный список (ЧС):
-
-- `/block add <name-or-peer-id> [reason]`
-- `/block remove <name-or-peer-id>`
-- `/block list`
-
-## Где лежат данные
-
-По умолчанию всё пишется в рабочую директорию (откуда запускаете бинарь):
-
-- `data/contacts/contacts.jsonl` — контакты
-- `data/blocklist/blocklist.jsonl` — ЧС
-- `data/history/*.jsonl` — история (имя файла = sha256(chat_id))
-
-## Документация для разработчиков
-
-- `ARCHITECTURE.md` — компоненты и потоки данных
-- `docs/DEV_FUNCTIONS.md` — описание каждой функции в `core/` (кроме `cli/`)
-
-## Frontend
-
-Desktop UI лежит в `frontend/`.
-
-Что нужно для запуска:
-
-- Go
-- Node.js / npm
-- Rust toolchain (для Tauri)
-
-Go bridge API можно запустить отдельно:
-
-```bash
-go run ./cmd/syne-ui-api
-```
-
-Web UI в dev-режиме:
-
-```bash
-cd frontend
-npm install
-npm run dev
-```
-
-Tauri desktop:
+### Запуск в dev
 
 ```bash
 cd frontend
@@ -127,12 +53,71 @@ npm install
 npm run tauri:dev
 ```
 
+### Сборка приложения
+
+```bash
+cd frontend
+npm run tauri:build
+```
+
+Готовое приложение:
+
+- `frontend/src-tauri/target/release/bundle/macos/Syne.app`
+
+Запуск:
+
+```bash
+open frontend/src-tauri/target/release/bundle/macos/Syne.app
+```
+
+Если macOS блокирует неподписанную локальную сборку:
+
+```bash
+xattr -dr com.apple.quarantine frontend/src-tauri/target/release/bundle/macos/Syne.app
+```
+
+## Windows
+
+В проекте уже есть Windows workflow в GitHub Actions:
+
+- `.github/workflows/windows-build.yml`
+
+Как забрать сборку:
+
+1. Открой `Actions`
+2. Открой успешный run `windows-build`
+3. Скачай artifact `syne-windows-bundles`
+
+Что обычно отдавать пользователю:
+
+- `.msi`, если нужен обычный установщик
+- `.exe`, если пайплайн собрал executable bundle и тебе нужен именно этот формат
+
+## Разработка
+
+Что нужно для разработки:
+
+- `Go`
+- `Node.js / npm`
+- `Rust toolchain`
+
+Основной desktop dev flow:
+
+```bash
+cd frontend
+npm install
+npm run tauri:dev
+```
+
+Что происходит:
+
+- Vite поднимает frontend
+- Go backend собирается как sidecar
+- Tauri запускает desktop shell
+
 ## Release Build
 
-Для standalone desktop-сборки фронтенд использует Go backend как `sidecar`.
-На целевой машине пользователя не нужны `Go`, `Node.js`, `npm` или `cargo`.
-
-Сборка релиза:
+Сборка desktop-релиза:
 
 ```bash
 cd frontend
@@ -140,25 +125,43 @@ npm install
 npm run tauri:build
 ```
 
-Что происходит:
+Сейчас релизный пайплайн делает следующее:
 
-- собирается web frontend
-- собирается Go binary `syne-ui-api`
-- binary кладётся в `src-tauri/binaries/` с суффиксом платформы
-- Tauri бандлит этот binary внутрь приложения
+- собирает React frontend
+- собирает Go backend как sidecar binary
+- бандлит sidecar внутрь desktop-приложения
 
-Важно:
+Для Windows самый надёжный путь:
 
-- Windows `.exe` / `.msi` нормально собирать на Windows runner или Windows машине
-- на macOS вы обычно собираете `.app` / `.dmg`, а не Windows `.exe`
-- для cross-target сборки sidecar можно задать `SIDECAR_TARGET_TRIPLE`
+- собирать на Windows машине
+- или использовать Windows runner в GitHub Actions
 
-Пример:
+## Файлы данных
 
-```bash
-cd frontend
-SIDECAR_TARGET_TRIPLE=x86_64-pc-windows-msvc npm run build:sidecar
-```
+Desktop-приложение хранит runtime-данные вне исходников.
 
-Windows `.exe` удобнее собирать на Windows машине или Windows CI runner.
-В репозитории есть стартовый workflow GitHub Actions: `.github/workflows/windows-build.yml`.
+В dev-режиме, в зависимости от способа запуска backend, ты всё ещё можешь видеть локальные data-файлы, которые использует Go core.
+
+Типичные данные:
+
+- user identity
+- contacts
+- blocklist
+- history
+
+Внутри legacy Go core всё ещё используются JSON/JSONL файлы.
+
+## Legacy CLI
+
+Старый CLI-код всё ещё есть в репозитории, но теперь он считается:
+
+- legacy
+- debug-only
+- не рекомендованным entrypoint
+
+Если ты читаешь этот README, чтобы запустить проект, старый консольный сценарий можно смело игнорировать, если только ты не дебажишь core.
+
+## Документация для разработчиков
+
+- `ARCHITECTURE.md`
+- `docs/DEV_FUNCTIONS.md`
