@@ -2,6 +2,7 @@ import {
   startTransition,
   useDeferredValue,
   useEffect,
+  useMemo,
   useState,
 } from "react";
 import {
@@ -42,6 +43,8 @@ const EMPTY_SNAPSHOT: Snapshot = {
   neighbors: [],
   chats: [],
 };
+
+const EMOJI_OPTIONS = ["🙂", "😎", "🤝", "🛰️", "🌿", "🔥", "🦊", "🐼", "🫡", "🌙"];
 
 function formatTime(value: number) {
   if (!value) {
@@ -128,15 +131,34 @@ function upsertNeighbor(snapshot: Snapshot, incoming: Snapshot["neighbors"][numb
 function describeError(err: unknown, fallback: string) {
   if (err instanceof Error) {
     const message = err.message.trim();
-    if (
-      !message ||
-      message === "The string did not match the expected pattern."
-    ) {
+    if (!message || message === "The string did not match the expected pattern.") {
       return fallback;
     }
     return message;
   }
   return fallback;
+}
+
+function readStorage<T>(key: string, fallback: T): T {
+  if (typeof window === "undefined") {
+    return fallback;
+  }
+  try {
+    const raw = window.localStorage.getItem(key);
+    if (!raw) {
+      return fallback;
+    }
+    return JSON.parse(raw) as T;
+  } catch {
+    return fallback;
+  }
+}
+
+function writeStorage<T>(key: string, value: T) {
+  if (typeof window === "undefined") {
+    return;
+  }
+  window.localStorage.setItem(key, JSON.stringify(value));
 }
 
 export default function App() {
@@ -148,10 +170,16 @@ export default function App() {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
-  const [showAddContact, setShowAddContact] = useState(false);
+  const [showNewContactPopover, setShowNewContactPopover] = useState(false);
   const [contactForm, setContactForm] = useState<Contact>(EMPTY_CONTACT);
-  const [renameValue, setRenameValue] = useState("");
   const [blockReason, setBlockReason] = useState("");
+  const [editingPeerName, setEditingPeerName] = useState(false);
+  const [peerNameDraft, setPeerNameDraft] = useState("");
+  const [emojiPickerTarget, setEmojiPickerTarget] = useState<"self" | "peer" | null>(null);
+  const [selfEmoji, setSelfEmoji] = useState(() => readStorage("syne.self_emoji", "🙂"));
+  const [peerEmojis, setPeerEmojis] = useState<Record<string, string>>(() =>
+    readStorage("syne.peer_emojis", {}),
+  );
   const deferredQuery = useDeferredValue(query);
 
   const selectedChat = snapshot.chats.find((item) => item.chat_id === selectedChatId) ?? null;
@@ -163,16 +191,18 @@ export default function App() {
     : null;
   const selectedMessages = selectedChat ? messages[selectedChat.chat_id] ?? [] : [];
   const selectedAddr = selectedChat?.known_addr || selectedPeer?.addr || "";
-  const filteredChats = snapshot.chats.filter((item) => {
+  const selectedPeerEmoji = selectedChat ? peerEmojis[selectedChat.peer_id] ?? "🙂" : "🙂";
+
+  const filteredChats = useMemo(() => {
     const needle = deferredQuery.trim().toLowerCase();
     if (!needle) {
-      return true;
+      return snapshot.chats;
     }
-    return (
+    return snapshot.chats.filter((item) => (
       item.title.toLowerCase().includes(needle) ||
       item.peer_id.toLowerCase().includes(needle)
-    );
-  });
+    ));
+  }, [deferredQuery, snapshot.chats]);
 
   async function refreshBootstrap(preserveSelection = true) {
     const nextSnapshot = await loadBootstrap();
@@ -183,9 +213,7 @@ export default function App() {
         return;
       }
       if (selectedChatId) {
-        const exists = nextSnapshot.chats.some(
-          (item) => item.chat_id === selectedChatId,
-        );
+        const exists = nextSnapshot.chats.some((item) => item.chat_id === selectedChatId);
         if (!exists) {
           setSelectedChatId(nextSnapshot.chats[0]?.chat_id ?? "");
         }
@@ -210,10 +238,9 @@ export default function App() {
         setLoading(true);
         await refreshBootstrap(false);
       } catch (err) {
-        if (!mounted) {
-          return;
+        if (mounted) {
+          setError(describeError(err, "Failed to reach local backend"));
         }
-        setError(describeError(err, "Failed to reach local backend"));
       } finally {
         if (mounted) {
           setLoading(false);
@@ -242,7 +269,6 @@ export default function App() {
         if (event.error) {
           setError(event.error);
         }
-
         if (event.message) {
           startTransition(() => {
             setMessages((current) => {
@@ -254,14 +280,11 @@ export default function App() {
                 : [...existing, event.message!];
               return {
                 ...current,
-                [event.message!.chat_id]: nextItems.sort(
-                  (a, b) => a.timestamp - b.timestamp,
-                ),
+                [event.message!.chat_id]: nextItems.sort((a, b) => a.timestamp - b.timestamp),
               };
             });
           });
         }
-
         if (event.chat) {
           startTransition(() => {
             setSnapshot((current) => ({
@@ -270,13 +293,11 @@ export default function App() {
             }));
           });
         }
-
         if (event.type === "peer_discovered" && event.peer) {
           startTransition(() => {
             setSnapshot((current) => upsertNeighbor(current, event.peer!));
           });
         }
-
         if (
           event.type === "contact_added" ||
           event.type === "contact_updated" ||
@@ -290,7 +311,6 @@ export default function App() {
     } catch (err) {
       setError(describeError(err, "Live updates are unavailable"));
     }
-
     return () => {
       stop();
     };
@@ -298,22 +318,21 @@ export default function App() {
 
   useEffect(() => {
     if (!selectedChat) {
-      setRenameValue("");
+      setPeerNameDraft("");
+      setEditingPeerName(false);
       setBlockReason("");
       return;
     }
-    setRenameValue(selectedContact?.name ?? selectedChat.title);
+    setPeerNameDraft(selectedContact?.name ?? selectedChat.title);
+    setEditingPeerName(false);
     setBlockReason("");
+    setEmojiPickerTarget(null);
   }, [selectedChat, selectedContact]);
 
   async function handleOpenPeer(peerId: string, peerAddr?: string, name?: string) {
     try {
       setError("");
-      const chat = await openPrivateChat({
-        peer_id: peerId,
-        peer_addr: peerAddr,
-        name,
-      });
+      const chat = await openPrivateChat({ peer_id: peerId, peer_addr: peerAddr, name });
       startTransition(() => {
         setSnapshot((current) => ({
           ...current,
@@ -356,7 +375,7 @@ export default function App() {
       setError("");
       await saveContact(contactForm);
       await refreshBootstrap();
-      setShowAddContact(false);
+      setShowNewContactPopover(false);
       setContactForm(buildEmptyContact());
     } catch (err) {
       setError(describeError(err, "Failed to save contact"));
@@ -365,17 +384,31 @@ export default function App() {
     }
   }
 
-  async function handleRename() {
-    if (!selectedChat || !renameValue.trim()) {
+  async function handleCommitPeerName() {
+    if (!selectedChat || !peerNameDraft.trim()) {
+      setEditingPeerName(false);
       return;
     }
     try {
       setSaving(true);
       setError("");
-      await renameContact(selectedChat.peer_id, renameValue.trim());
+      if (selectedContact) {
+        await renameContact(selectedChat.peer_id, peerNameDraft.trim());
+      } else {
+        const draft = buildContactDraft(selectedChat, selectedAddr);
+        if (!draft.ip || !draft.port) {
+          setError("Peer address is not known yet. Open the peer or add the contact manually.");
+          return;
+        }
+        await saveContact({
+          ...draft,
+          name: peerNameDraft.trim(),
+        });
+      }
       await refreshBootstrap();
+      setEditingPeerName(false);
     } catch (err) {
-      setError(describeError(err, "Failed to rename contact"));
+      setError(describeError(err, "Failed to save peer name"));
     } finally {
       setSaving(false);
     }
@@ -408,6 +441,7 @@ export default function App() {
         query: selectedChat.peer_id,
         reason: blockReason.trim(),
       });
+      setBlockReason("");
       await refreshBootstrap();
     } catch (err) {
       setError(describeError(err, "Failed to block peer"));
@@ -429,22 +463,56 @@ export default function App() {
     }
   }
 
-  function openManualContactForm() {
-    setShowAddContact(true);
+  function openManualContactPopover() {
     setContactForm(buildEmptyContact());
+    setShowNewContactPopover(true);
   }
 
-  function openSelectedContactForm() {
-    setShowAddContact(true);
+  function prefillFromCurrentPeer() {
     setContactForm(buildContactDraft(selectedChat, selectedAddr));
+    setShowNewContactPopover(true);
+  }
+
+  function updateSelfEmoji(nextEmoji: string) {
+    setSelfEmoji(nextEmoji);
+    writeStorage("syne.self_emoji", nextEmoji);
+    setEmojiPickerTarget(null);
+  }
+
+  function updatePeerEmoji(nextEmoji: string) {
+    if (!selectedChat) {
+      return;
+    }
+    const nextMap = {
+      ...peerEmojis,
+      [selectedChat.peer_id]: nextEmoji,
+    };
+    setPeerEmojis(nextMap);
+    writeStorage("syne.peer_emojis", nextMap);
+    setEmojiPickerTarget(null);
   }
 
   return (
     <div className="app-shell">
       <aside className="rail rail-left">
         <section className="profile-strip">
-          <div className="avatar-badge" aria-hidden="true">
-            🙂
+          <div className="emoji-anchor">
+            <button
+              type="button"
+              className="avatar-badge avatar-button"
+              onClick={() => setEmojiPickerTarget((current) => (current === "self" ? null : "self"))}
+            >
+              {selfEmoji}
+            </button>
+            {emojiPickerTarget === "self" ? (
+              <div className="emoji-popover emoji-popover-left">
+                {EMOJI_OPTIONS.map((emoji) => (
+                  <button key={emoji} type="button" className="emoji-option" onClick={() => updateSelfEmoji(emoji)}>
+                    {emoji}
+                  </button>
+                ))}
+              </div>
+            ) : null}
           </div>
           <div className="profile-copy-block">
             <p className="eyebrow">You</p>
@@ -485,9 +553,7 @@ export default function App() {
                 </div>
               </button>
             ))}
-            {!filteredChats.length ? (
-              <div className="empty-state compact">No chats yet.</div>
-            ) : null}
+            {!filteredChats.length ? <div className="empty-state compact">No chats yet.</div> : null}
           </div>
         </section>
 
@@ -501,9 +567,7 @@ export default function App() {
               <button
                 key={peer.peer_id}
                 className="neighbor-row"
-                onClick={() =>
-                  handleOpenPeer(peer.peer_id, peer.addr, peer.name || peer.peer_id)
-                }
+                onClick={() => handleOpenPeer(peer.peer_id, peer.addr, peer.name || peer.peer_id)}
               >
                 <strong>{peer.name || peer.peer_id}</strong>
                 <span>{peer.addr}</span>
@@ -513,6 +577,60 @@ export default function App() {
               <div className="empty-state compact">Waiting for LAN peers.</div>
             ) : null}
           </div>
+        </section>
+
+        <section className="contact-launcher">
+          <button type="button" className="new-contact-button" onClick={openManualContactPopover}>
+            New contact
+          </button>
+          {showNewContactPopover ? (
+            <div className="contact-popover">
+              <div className="panel-head popover-head">
+                <h2>New contact</h2>
+                <button type="button" className="ghost-tiny" onClick={() => setShowNewContactPopover(false)}>
+                  Close
+                </button>
+              </div>
+              <div className="popover-form">
+                <label>
+                  <span>Display Name</span>
+                  <input
+                    value={contactForm.name}
+                    onChange={(event) => setContactForm((current) => ({ ...current, name: event.target.value }))}
+                  />
+                </label>
+                <label>
+                  <span>IP</span>
+                  <input
+                    value={contactForm.ip}
+                    onChange={(event) => setContactForm((current) => ({ ...current, ip: event.target.value }))}
+                  />
+                </label>
+                <label>
+                  <span>Peer ID</span>
+                  <input
+                    value={contactForm.peer_id}
+                    onChange={(event) => setContactForm((current) => ({ ...current, peer_id: event.target.value }))}
+                  />
+                </label>
+                <label>
+                  <span>Port</span>
+                  <input
+                    value={contactForm.port}
+                    onChange={(event) => setContactForm((current) => ({ ...current, port: event.target.value }))}
+                  />
+                </label>
+              </div>
+              <div className="action-row">
+                <button type="button" className="ghost" disabled={!selectedChat} onClick={prefillFromCurrentPeer}>
+                  Use current peer
+                </button>
+                <button type="button" disabled={saving} onClick={() => void handleSaveContact()}>
+                  Save contact
+                </button>
+              </div>
+            </div>
+          ) : null}
         </section>
       </aside>
 
@@ -549,11 +667,7 @@ export default function App() {
                     className={`bubble ${message.direction}`}
                   >
                     <header>
-                      <strong>
-                        {message.direction === "outgoing"
-                          ? "You"
-                          : message.from_name || selectedChat.title || message.from}
-                      </strong>
+                      <strong>{message.direction === "outgoing" ? "You" : message.from_name || selectedChat.title || message.from}</strong>
                       <time>{formatTime(message.timestamp)}</time>
                     </header>
                     <p>{message.text}</p>
@@ -593,138 +707,132 @@ export default function App() {
       <aside className="rail rail-right">
         {selectedChat ? (
           <>
-            {/* Блок 1: Основная информация (Профиль) */}
-            <section className="profile-details-hero">
-              <div className="avatar-large">🙂</div>
-              <h2>{selectedChat.title}</h2>
-              <span className="status-indicator">
-                {selectedChat.online ? "● Online" : "○ Offline"}
-              </span>
-              <div className="peer-id-badge" onClick={() => navigator.clipboard.writeText(selectedChat.peer_id)}>
-                <code>{selectedChat.peer_id}</code>
-              </div>
-            </section>
+            <section className="panel peer-panel panel-fill">
+              <div className="peer-hero">
+                <div className="emoji-anchor">
+                  <button
+                    type="button"
+                    className="avatar-large avatar-button"
+                    onClick={() => setEmojiPickerTarget((current) => (current === "peer" ? null : "peer"))}
+                  >
+                    {selectedPeerEmoji}
+                  </button>
+                  {emojiPickerTarget === "peer" ? (
+                    <div className="emoji-popover">
+                      {EMOJI_OPTIONS.map((emoji) => (
+                        <button key={emoji} type="button" className="emoji-option" onClick={() => updatePeerEmoji(emoji)}>
+                          {emoji}
+                        </button>
+                      ))}
+                    </div>
+                  ) : null}
+                </div>
 
-            {/* Блок 2: Управление контактом */}
-            <section className="panel action-panel">
-              <div className="panel-head">
-                <h2>{selectedContact ? "Contact Info" : "New Peer"}</h2>
-                <button 
-                  className="ghost-tiny" 
-                  onClick={() => setShowAddContact(!showAddContact)}
-                >
-                  {showAddContact ? "Close" : "Edit / Add"}
-                </button>
-              </div>
-
-              {!showAddContact ? (
-                <div className="contact-summary">
-                  <div className="info-row">
-                    <span>Address</span>
-                    <strong>{selectedAddr || "Unknown"}</strong>
-                  </div>
-                  {!selectedContact && (
-                    <button className="primary-action" onClick={openSelectedContactForm}>
-                      Add to Contacts
+                <div className="peer-title-block">
+                  {editingPeerName ? (
+                    <input
+                      className="inline-name-input"
+                      value={peerNameDraft}
+                      autoFocus
+                      onChange={(event) => setPeerNameDraft(event.target.value)}
+                      onBlur={() => void handleCommitPeerName()}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter") {
+                          event.preventDefault();
+                          void handleCommitPeerName();
+                        }
+                        if (event.key === "Escape") {
+                          setEditingPeerName(false);
+                          setPeerNameDraft(selectedContact?.name ?? selectedChat.title);
+                        }
+                      }}
+                    />
+                  ) : (
+                    <button type="button" className="editable-name" onClick={() => setEditingPeerName(true)}>
+                      {selectedChat.title}
                     </button>
                   )}
+                  <p>{selectedChat.online ? "Online now" : "Known peer"}</p>
                 </div>
-              ) : (
-                <div className="form-grid">
-                  <label>
-                    <span>Display Name</span>
-                    <input
-                      value={contactForm.name}
-                      onChange={(e) => setContactForm({ ...contactForm, name: e.target.value })}
-                    />
-                  </label>
-                  <div className="form-row">
-                    <label>
-                      <span>IP</span>
-                      <input
-                        value={contactForm.ip}
-                        onChange={(e) => setContactForm({ ...contactForm, ip: e.target.value })}
-                      />
-                    </label>
-                    <label>
-                      <span>Port</span>
-                      <input
-                        className="port-input"
-                        value={contactForm.port}
-                        onChange={(e) => setContactForm({ ...contactForm, port: e.target.value })}
-                      />
-                    </label>
-                  </div>
-                  <div className="action-stack">
-                    <button className="solid" disabled={saving} onClick={() => void handleSaveContact()}>
-                      Save Changes
-                    </button>
-                  </div>
-                </div>
-              )}
-            </section>
+              </div>
 
-            {/* Блок 3: Безопасность и Блокировка */}
-            <section className="panel action-panel danger-zone">
-              <div className="panel-head">
-                <h2>Privacy</h2>
+              <div className="peer-meta-card">
+                <div>
+                  <span>Address</span>
+                  <strong>{selectedAddr || "Address not known yet"}</strong>
+                </div>
+                <div>
+                  <span>Peer ID</span>
+                  <strong>{selectedChat.peer_id}</strong>
+                </div>
               </div>
-              <div className="inline-form block-controls">
-                <input
-                  placeholder="Reason for blocking..."
-                  value={blockReason}
-                  onChange={(event) => setBlockReason(event.target.value)}
-                />
+
+              <div className="action-stack top-gap">
+                <button className="ghost" onClick={prefillFromCurrentPeer}>
+                  {selectedContact ? "Update contact details" : "Save as contact"}
+                </button>
                 <button
-                  className="danger-btn"
-                  disabled={saving}
-                  onClick={() => void handleBlock()}
+                  className="ghost"
+                  disabled={!selectedAddr}
+                  onClick={() => void handleOpenPeer(selectedChat.peer_id, selectedAddr, selectedChat.title)}
                 >
-                  Block
+                  Refresh handshake
+                </button>
+                {selectedContact ? (
+                  <button className="ghost" disabled={saving} onClick={() => void handleDeleteContact()}>
+                    Delete contact
+                  </button>
+                ) : null}
+              </div>
+
+              <div className="block-box">
+                <label>
+                  <span>Block reason</span>
+                  <input
+                    placeholder="Reason for blocking"
+                    value={blockReason}
+                    onChange={(event) => setBlockReason(event.target.value)}
+                  />
+                </label>
+                <button className="danger" disabled={saving} onClick={() => void handleBlock()}>
+                  Block peer
                 </button>
               </div>
-              
-              {selectedContact && (
-                <button
-                  className="ghost-danger-link"
-                  disabled={saving}
-                  onClick={() => void handleDeleteContact()}
-                >
-                  Delete Contact
-                </button>
-              )}
             </section>
           </>
         ) : (
-          <div className="empty-state">
+          <div className="empty-state peer-empty">
             <h3>No peer selected</h3>
-            <p>Select a chat to manage connection</p>
+            <p>Select a chat to manage contact details.</p>
           </div>
         )}
 
-        {/* Список заблокированных — теперь компактный в самом низу */}
-        {snapshot.blocked.length > 0 && (
-          <section className="panel blocked-panel-mini">
-            <div className="panel-head">
-              <h2>Blocked list</h2>
-              <span>{snapshot.blocked.length}</span>
-            </div>
-            <div className="blocked-scroll">
-              {snapshot.blocked.map((item) => (
-                <div key={item.peer_id} className="blocked-row-mini">
-                  <span>{item.name || "Unknown"}</span>
-                  <button onClick={() => void handleUnblock(item.peer_id)}>Unblock</button>
+        <section className="panel blocked-panel">
+          <div className="panel-head">
+            <h2>Blocked</h2>
+            <span>{snapshot.blocked.length}</span>
+          </div>
+          <div className="blocked-list">
+            {snapshot.blocked.map((item) => (
+              <div key={item.peer_id} className="blocked-item">
+                <div>
+                  <strong>{item.name || item.peer_id}</strong>
+                  <span>{item.reason || "No reason"}</span>
                 </div>
-              ))}
-            </div>
-          </section>
-        )}
+                <button className="ghost" onClick={() => void handleUnblock(item.peer_id)}>
+                  Unblock
+                </button>
+              </div>
+            ))}
+            {!snapshot.blocked.length ? <div className="empty-state compact">Blocklist is empty.</div> : null}
+          </div>
+        </section>
 
-        {error && (
+        {error ? (
           <div className="error-toast">
             <strong>Error:</strong> {error}
           </div>
-        )}
+        ) : null}
       </aside>
     </div>
   );
