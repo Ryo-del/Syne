@@ -471,12 +471,27 @@ func (s *Service) AddContact(contact corechat.Contact) (corechat.Contact, error)
 	if err != nil {
 		return corechat.Contact{}, err
 	}
+	chatID := privateChatID(s.cfg.LocalID, created.PeerID)
+	if err := history.TouchChat(history.ChatRecord{
+		ChatID: chatID,
+		PeerID: created.PeerID,
+		Title:  created.Name,
+	}); err != nil {
+		return corechat.Contact{}, err
+	}
 
 	s.emit(Event{
 		Type:      "contact_added",
 		Timestamp: time.Now().UnixMilli(),
 		Contact:   &created,
 	})
+	if summary, err := s.chatSummaryByID(chatID); err == nil {
+		s.emit(Event{
+			Type:      "chat_updated",
+			Timestamp: time.Now().UnixMilli(),
+			Chat:      &summary,
+		})
+	}
 	return created, nil
 }
 
