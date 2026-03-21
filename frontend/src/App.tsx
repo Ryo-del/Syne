@@ -496,24 +496,29 @@ export default function App() {
     <div className="app-shell">
       <aside className="rail rail-left">
         <section className="profile-strip">
-          <div className="emoji-anchor">
-            <button
-              type="button"
-              className="avatar-badge avatar-button"
-              onClick={() => setEmojiPickerTarget((current) => (current === "self" ? null : "self"))}
-            >
-              {selfEmoji}
-            </button>
-            {emojiPickerTarget === "self" ? (
-              <div className="emoji-popover emoji-popover-left">
-                {EMOJI_OPTIONS.map((emoji) => (
-                  <button key={emoji} type="button" className="emoji-option" onClick={() => updateSelfEmoji(emoji)}>
-                    {emoji}
-                  </button>
-                ))}
-              </div>
-            ) : null}
-          </div>
+        <div className="emoji-anchor">
+  <button
+    type="button"
+    className="avatar-badge avatar-button"
+    onClick={() => setEmojiPickerTarget((current) => (current === "self" ? null : "self"))}
+  >
+    {selfEmoji}
+  </button>
+  {emojiPickerTarget === "self" ? (
+    <div className="emoji-popover emoji-popover-left scrollable-emoji">
+      {EMOJI_OPTIONS.map((emoji) => (
+        <button 
+          key={emoji} 
+          type="button" 
+          className="emoji-option" 
+          onClick={() => updateSelfEmoji(emoji)}
+        >
+          {emoji}
+        </button>
+      ))}
+    </div>
+  ) : null}
+</div>
           <div className="profile-copy-block">
             <p className="eyebrow">You</p>
             <h2>{snapshot.local_display_id || snapshot.local_id || "Pending"}</h2>
@@ -705,135 +710,128 @@ export default function App() {
       </main>
 
       <aside className="rail rail-right">
-        {selectedChat ? (
-          <>
-            <section className="panel peer-panel panel-fill">
-              <div className="peer-hero">
-                <div className="emoji-anchor">
-                  <button
-                    type="button"
-                    className="avatar-large avatar-button"
-                    onClick={() => setEmojiPickerTarget((current) => (current === "peer" ? null : "peer"))}
-                  >
-                    {selectedPeerEmoji}
-                  </button>
-                  {emojiPickerTarget === "peer" ? (
-                    <div className="emoji-popover">
-                      {EMOJI_OPTIONS.map((emoji) => (
-                        <button key={emoji} type="button" className="emoji-option" onClick={() => updatePeerEmoji(emoji)}>
-                          {emoji}
-                        </button>
-                      ))}
-                    </div>
-                  ) : null}
-                </div>
+  {selectedChat ? (
+    <section className="panel peer-panel panel-fill discord-profile-card">
+      {/* Верхняя декоративная плашка */}
+      <div className="profile-banner"></div>
 
-                <div className="peer-title-block">
-                  {editingPeerName ? (
-                    <input
-                      className="inline-name-input"
-                      value={peerNameDraft}
-                      autoFocus
-                      onChange={(event) => setPeerNameDraft(event.target.value)}
-                      onBlur={() => void handleCommitPeerName()}
-                      onKeyDown={(event) => {
-                        if (event.key === "Enter") {
-                          event.preventDefault();
-                          void handleCommitPeerName();
-                        }
-                        if (event.key === "Escape") {
-                          setEditingPeerName(false);
-                          setPeerNameDraft(selectedContact?.name ?? selectedChat.title);
-                        }
-                      }}
-                    />
-                  ) : (
-                    <button type="button" className="editable-name" onClick={() => setEditingPeerName(true)}>
-                      {selectedChat.title}
-                    </button>
-                  )}
-                  <p>{selectedChat.online ? "Online now" : "Known peer"}</p>
-                </div>
-              </div>
-
-              <div className="peer-meta-card">
-                <div>
-                  <span>Address</span>
-                  <strong>{selectedAddr || "Address not known yet"}</strong>
-                </div>
-                <div>
-                  <span>Peer ID</span>
-                  <strong>{selectedChat.peer_id}</strong>
-                </div>
-              </div>
-
-              <div className="action-stack top-gap">
-                <button className="ghost" onClick={prefillFromCurrentPeer}>
-                  {selectedContact ? "Update contact details" : "Save as contact"}
+      <div className="peer-hero">
+        <div className="emoji-anchor">
+          <button
+            type="button"
+            className="avatar-large avatar-button profile-avatar"
+            onClick={() => setEmojiPickerTarget((current) => (current === "peer" ? null : "peer"))}
+          >
+            {selectedPeerEmoji}
+            <div className={`status-badge ${selectedChat.online ? "online" : ""}`}></div>
+          </button>
+          
+          {emojiPickerTarget === "peer" ? (
+            <div className="emoji-popover scrollable-emoji">
+              {EMOJI_OPTIONS.map((emoji) => (
+                <button key={emoji} type="button" className="emoji-option" onClick={() => updatePeerEmoji(emoji)}>
+                  {emoji}
                 </button>
-                <button
-                  className="ghost"
-                  disabled={!selectedAddr}
-                  onClick={() => void handleOpenPeer(selectedChat.peer_id, selectedAddr, selectedChat.title)}
-                >
-                  Refresh handshake
-                </button>
-                {selectedContact ? (
-                  <button className="ghost" disabled={saving} onClick={() => void handleDeleteContact()}>
-                    Delete contact
-                  </button>
-                ) : null}
-              </div>
+              ))}
+            </div>
+          ) : null}
+        </div>
 
-              <div className="block-box">
-                <label>
-                  <span>Block reason</span>
-                  <input
-                    placeholder="Reason for blocking"
-                    value={blockReason}
-                    onChange={(event) => setBlockReason(event.target.value)}
-                  />
-                </label>
-                <button className="danger" disabled={saving} onClick={() => void handleBlock()}>
-                  Block peer
-                </button>
-              </div>
-            </section>
-          </>
-        ) : (
-          <div className="empty-state peer-empty">
-            <h3>No peer selected</h3>
-            <p>Select a chat to manage contact details.</p>
-          </div>
+        <div className="peer-title-block">
+          {editingPeerName ? (
+            <input
+              className="inline-name-input"
+              value={peerNameDraft}
+              autoFocus
+              onChange={(event) => setPeerNameDraft(event.target.value)}
+              onBlur={() => void handleCommitPeerName()}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  event.preventDefault();
+                  void handleCommitPeerName();
+                }
+                if (event.key === "Escape") {
+                  setEditingPeerName(false);
+                  setPeerNameDraft(selectedContact?.name ?? selectedChat.title);
+                }
+              }}
+            />
+          ) : (
+            <button type="button" className="editable-name" onClick={() => setEditingPeerName(true)}>
+              {selectedChat.title}
+            </button>
+          )}
+          <p className="peer-id-subtextline">@{selectedChat.peer_id.slice(0, 8)}...</p>
+        </div>
+      </div>
+
+      <div className="profile-content-scrollable">
+        <div className="profile-divider"></div>
+        
+        {/* Секция с кнопкой действий (бывшая Update/Save) */}
+        {!selectedContact && (
+           <button className="primary-action-btn" onClick={prefillFromCurrentPeer}>
+             Add to Contacts
+           </button>
         )}
 
-        <section className="panel blocked-panel">
-          <div className="panel-head">
-            <h2>Blocked</h2>
-            <span>{snapshot.blocked.length}</span>
+        <div className="info-section">
+          <span className="section-label">PEER ID</span>
+          <div className="id-copy-box" onClick={() => navigator.clipboard.writeText(selectedChat.peer_id)}>
+            <code>{selectedChat.peer_id}</code>
           </div>
-          <div className="blocked-list">
-            {snapshot.blocked.map((item) => (
-              <div key={item.peer_id} className="blocked-item">
-                <div>
-                  <strong>{item.name || item.peer_id}</strong>
-                  <span>{item.reason || "No reason"}</span>
-                </div>
-                <button className="ghost" onClick={() => void handleUnblock(item.peer_id)}>
-                  Unblock
-                </button>
-              </div>
-            ))}
-            {!snapshot.blocked.length ? <div className="empty-state compact">Blocklist is empty.</div> : null}
-          </div>
-        </section>
+        </div>
+      </div>
 
-        {error ? (
-          <div className="error-toast">
-            <strong>Error:</strong> {error}
+      {/* Блок блокировки примагничен к низу карточки */}
+      <div className="block-box-footer">
+        <div className="inline-block-form">
+          <input
+            placeholder="Reason..."
+            value={blockReason}
+            onChange={(event) => setBlockReason(event.target.value)}
+          />
+          <button className="danger-icon-btn" title="Block Peer" onClick={() => void handleBlock()}>
+            Block
+          </button>
+        </div>
+      </div>
+    </section>
+  ) : (
+    <div className="empty-state peer-empty">
+      <h3>No peer selected</h3>
+      <p>Select a chat to view profile.</p>
+    </div>
+  )}
+
+  {/* Карточка заблокированных с фиксированной высотой и прокруткой */}
+  <section className="panel blocked-panel scrollable-panel">
+    <div className="panel-head">
+      <h2>Blocked</h2>
+      <span>{snapshot.blocked.length}</span>
+    </div>
+    <div className="blocked-list scroll-area">
+      {snapshot.blocked.map((item) => (
+        <div key={item.peer_id} className="blocked-item">
+          <div className="blocked-info">
+            <strong>{item.name || "Unknown"}</strong>
+            <span>{item.reason || "No reason"}</span>
           </div>
-        ) : null}
-      </aside>
+          <button className="ghost-tiny" onClick={() => void handleUnblock(item.peer_id)}>
+            Unblock
+          </button>
+        </div>
+      ))}
+      {!snapshot.blocked.length ? <div className="empty-state compact">Clear</div> : null}
+    </div>
+  </section>
+
+  {error ? (
+    <div className="error-toast">
+      <strong>Error:</strong> {error}
+    </div>
+  ) : null}
+</aside>
     </div>
   );
 }
