@@ -60,6 +60,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/health", srv.handleHealth)
 	mux.HandleFunc("/api/bootstrap", srv.handleBootstrap)
+	mux.HandleFunc("/api/profile", srv.handleProfile)
 	mux.HandleFunc("/api/events", srv.handleEvents)
 	mux.HandleFunc("/api/chats/open", srv.handleOpenChat)
 	mux.HandleFunc("/api/chats/read", srv.handleReadChat)
@@ -113,6 +114,44 @@ func (s *server) handleBootstrap(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, snapshot)
+}
+
+func (s *server) handleProfile(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		snapshot, err := s.service.Snapshot()
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{
+			"local_id":         snapshot.LocalID,
+			"local_display_id": snapshot.LocalDisplayID,
+		})
+	case http.MethodPatch:
+		var req struct {
+			DisplayID string `json:"display_id"`
+		}
+		if err := decodeJSON(r, &req); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if err := s.service.UpdateLocalDisplayID(req.DisplayID); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		snapshot, err := s.service.Snapshot()
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{
+			"local_id":         snapshot.LocalID,
+			"local_display_id": snapshot.LocalDisplayID,
+		})
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
 }
 
 func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {

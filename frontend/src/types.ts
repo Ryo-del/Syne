@@ -37,6 +37,7 @@ export type UIMessage = {
   chat_id: string;
   target_id: string;
   from: string;
+  from_name?: string;
   text: string;
   timestamp: number;
   direction: "incoming" | "outgoing";
@@ -44,11 +45,17 @@ export type UIMessage = {
 
 export type Snapshot = {
   local_id: string;
+  local_display_id: string;
   port: number;
   contacts: Contact[];
   blocked: BlockedPeer[];
   neighbors: PeerPresence[];
   chats: ChatSummary[];
+};
+
+export type Profile = {
+  local_id: string;
+  local_display_id: string;
 };
 
 export type AppEvent = {

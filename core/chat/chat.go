@@ -19,7 +19,8 @@ type Contact struct {
 }
 
 type UserData struct {
-	ID string `json:"ID"`
+	ID        string `json:"ID"`
+	DisplayID string `json:"display_id,omitempty"`
 }
 
 func (c Contact) Address() string {
@@ -52,6 +53,27 @@ func DeleteContact(query string) error {
 }
 
 func SaveUserData(id string) error {
+	profile, err := GetUserData()
+	if err != nil {
+		return err
+	}
+	profile.ID = strings.TrimSpace(id)
+	if profile.DisplayID == "" {
+		profile.DisplayID = profile.ID
+	}
+	return SaveUserProfile(profile)
+}
+
+func SaveUserProfile(data UserData) error {
+	data.ID = strings.TrimSpace(data.ID)
+	data.DisplayID = strings.TrimSpace(data.DisplayID)
+	if data.ID == "" {
+		return fmt.Errorf("id is required")
+	}
+	if data.DisplayID == "" {
+		data.DisplayID = data.ID
+	}
+
 	path, err := UserDataFilePath()
 	if err != nil {
 		return err
@@ -63,32 +85,42 @@ func SaveUserData(id string) error {
 	}
 	defer file.Close()
 
-	data := UserData{ID: id}
-
 	return json.NewEncoder(file).Encode(data)
 }
 
-func GetUserID() (string, error) {
+func GetUserData() (UserData, error) {
 	path, err := UserDataFilePath()
 	if err != nil {
-		return "", err
+		return UserData{}, err
 	}
 
 	file, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return "", nil // Файла нет — это не ошибка, просто ID еще не создан
+			return UserData{}, nil // Файла нет — это не ошибка, просто профиль еще не создан
 		}
-		return "", err
+		return UserData{}, err
 	}
 	defer file.Close()
 
 	var data UserData
 	err = json.NewDecoder(file).Decode(&data)
 	if err != nil {
-		return "", nil
+		return UserData{}, nil
 	}
+	data.ID = strings.TrimSpace(data.ID)
+	data.DisplayID = strings.TrimSpace(data.DisplayID)
+	if data.DisplayID == "" {
+		data.DisplayID = data.ID
+	}
+	return data, nil
+}
 
+func GetUserID() (string, error) {
+	data, err := GetUserData()
+	if err != nil {
+		return "", err
+	}
 	return data.ID, nil
 }
 func RenameContact(query, newName string) error {

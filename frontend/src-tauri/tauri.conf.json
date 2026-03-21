@@ -13,8 +13,8 @@
     "active": true,
     "externalBin": ["binaries/syne-ui-api"],
     "icon": [
-      "icons/icon.png",
-      "icons/icon.ico"
+      "icons/app-icon.png",
+      "icons/app-icon.ico"
     ]
   },
   "app": {

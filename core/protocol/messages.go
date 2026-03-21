@@ -37,6 +37,7 @@ type Message struct {
 	TargetID string `json:"target_id"`
 	ChatID   string `json:"chat_id"`
 	From     string `json:"from"`
+	FromName string `json:"from_name,omitempty"`
 	FromPub  []byte `json:"from_pub,omitempty"` // X25519 public key (32 bytes) for key agreement/handshake
 	Payload  []byte `json:"payload"`
 	Nonce    []byte `json:"nonce,omitempty"` // для MsgChat: nonce шифрования (если есть — Payload зашифрован)

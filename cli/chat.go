@@ -129,6 +129,7 @@ func RunChat(ctx context.Context, cfg Config) error {
 		}
 
 		join := protocol.NewJoin(chatID, cfg.LocalID, peerID)
+		join.FromName = cfg.LocalID
 		join.FromPub = identityPub
 		if err := sendProtocolMessage(peer, join); err != nil {
 			fmt.Printf("join send error: %v\n", err)
@@ -138,7 +139,7 @@ func RunChat(ctx context.Context, cfg Config) error {
 	fmt.Print("\n/help - show commands\n\n")
 	fmt.Println("Then type text to send into active chat. Ctrl+C to exit.")
 
-	if err := discovery.StartLANDiscovery(ctx, cfg.LocalID, cfg.LocalPort, func(peerID, addr string) {
+	if err := discovery.StartLANDiscovery(ctx, cfg.LocalID, func() string { return cfg.LocalID }, cfg.LocalPort, func(peerID, addr, _ string) {
 		neighborsMu.Lock()
 		neighbors[peerID] = addr
 		neighborsMu.Unlock()
@@ -213,6 +214,7 @@ func RunChat(ctx context.Context, cfg Config) error {
 
 				fmt.Printf("\n[system] %s joined chat %s\n> ", msg.From, msg.ChatID)
 				ack := protocol.NewJoinAck(msg.ChatID, cfg.LocalID, msg.From)
+				ack.FromName = cfg.LocalID
 				ack.FromPub = identityPub
 				if err := sendAckToContact(ack, sender); err != nil {
 					fmt.Printf("join ack send error: %v\n", err)

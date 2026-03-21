@@ -28,11 +28,12 @@ html,
 body,
 #root {
   margin: 0;
-  min-height: 100%;
+  height: 100%;
 }
 
 body {
   min-height: 100vh;
+  overflow: hidden;
 }
 
 button,
@@ -47,25 +48,149 @@ button {
 }
 
 .app-shell {
-  min-height: 100vh;
+  height: 100vh;
   display: grid;
   grid-template-columns: 320px minmax(0, 1fr) 340px;
   gap: 18px;
   padding: 18px;
+  overflow: hidden;
 }
 
 .rail,
 .stage {
-  min-height: calc(100vh - 36px);
+  min-height: 0;
 }
 
 .rail {
   display: flex;
   flex-direction: column;
   gap: 18px;
+  overflow: hidden;
+}
+/* Профиль сверху */
+.profile-details-hero {
+  padding: 40px 20px;
+  text-align: center;
+  background: var(--paper-strong);
+  border-bottom: 1px solid var(--line);
+  margin-bottom: 16px;
+}
+
+.avatar-large {
+  font-size: 48px;
+  margin-bottom: 12px;
+}
+
+.status-indicator {
+  display: block;
+  font-size: 12px;
+  color: var(--signal);
+  margin-top: 4px;
+}
+
+.peer-id-badge {
+  margin-top: 12px;
+  display: inline-block;
+  background: var(--bg);
+  padding: 4px 8px;
+  border-radius: 6px;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+/* Формы и кнопки */
+.form-row {
+  display: flex;
+  gap: 8px;
+}
+
+.port-input {
+  width: 80px;
+}
+
+.primary-action {
+  width: 100%;
+  padding: 10px;
+  background: var(--accent);
+  color: white;
+  border: none;
+  border-radius: 8px;
+  font-weight: 600;
+  margin-top: 12px;
+}
+
+/* Опасная зона */
+.danger-zone {
+  border-top: 1px solid var(--line);
+  margin-top: auto; /* Прижимает к низу, если есть место */
+}
+
+.danger-btn {
+  background: var(--danger);
+  color: white;
+  border: none;
+  padding: 8px 16px;
+  border-radius: 6px;
+}
+
+.ghost-danger-link {
+  display: block;
+  width: 100%;
+  background: transparent;
+  color: var(--danger);
+  border: none;
+  font-size: 13px;
+  margin-top: 16px;
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+.ghost-tiny {
+  background: none;
+  border: 1px solid var(--line);
+  font-size: 10px;
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+
+/* Тост ошибки */
+.error-toast {
+  position: absolute;
+  bottom: 20px;
+  right: 20px;
+  background: var(--danger);
+  color: white;
+  padding: 12px 20px;
+  border-radius: 8px;
+  box-shadow: var(--shadow);
+}
+/* Упрощаем правую панель */
+.rail-right {
+  background: var(--paper-strong); /* Делаем фон чуть плотнее, чтобы отделить от чата */
+  border-left: 1px solid var(--line);
+  padding: 0; /* Убираем лишние отступы у контейнера */
+}
+
+/* Группируем элементы внутри одного блока, а не плодим 10 панелей */
+.profile-details {
+  padding: 32px 24px;
+  text-align: center;
+  border-bottom: 1px solid var(--line);
+}
+
+.action-group {
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.rail-right {
+  overflow-y: auto;
+  padding-right: 4px;
 }
 
 .brand-card,
+.profile-strip,
 .panel,
 .stage,
 .stage-topbar,
@@ -74,6 +199,7 @@ button {
 }
 
 .brand-card,
+.profile-strip,
 .panel,
 .stage {
   border: 1px solid var(--line);
@@ -102,6 +228,42 @@ button {
   );
 }
 
+.profile-strip {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 18px 20px;
+}
+
+.avatar-badge {
+  width: 58px;
+  height: 58px;
+  flex: 0 0 58px;
+  display: grid;
+  place-items: center;
+  border-radius: 999px;
+  background: linear-gradient(135deg, rgba(212, 90, 59, 0.18), rgba(255, 255, 255, 0.82));
+  border: 1px solid rgba(212, 90, 59, 0.18);
+  font-size: 1.7rem;
+}
+
+.profile-copy-block {
+  min-width: 0;
+}
+
+.profile-copy-block h2 {
+  margin: 0;
+  font-size: 1.2rem;
+  line-height: 1.1;
+  letter-spacing: -0.02em;
+}
+
+.profile-copy-block p:last-child {
+  margin: 6px 0 0;
+  color: var(--muted);
+  font-size: 0.92rem;
+}
+
 .eyebrow {
   margin: 0 0 8px;
   text-transform: uppercase;
@@ -124,9 +286,9 @@ button {
 }
 
 .brand-copy {
-  margin: 16px 0 24px;
+  margin: 16px 0 22px;
   max-width: 18rem;
-  line-height: 1.55;
+  line-height: 1.45;
   color: var(--muted);
 }
 
@@ -152,10 +314,14 @@ button {
   margin: 0;
   text-align: right;
   font-weight: 600;
+  overflow-wrap: anywhere;
 }
 
 .panel {
   padding: 18px;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
 }
 
 .panel.accent {
@@ -218,6 +384,8 @@ button {
   display: flex;
   flex-direction: column;
   gap: 10px;
+  min-height: 0;
+  overflow: auto;
 }
 
 .chat-row,
@@ -225,16 +393,16 @@ button {
   width: 100%;
   text-align: left;
   background: rgba(255, 255, 255, 0.54);
-  border: 1px solid transparent;
+  border: 1px solid rgba(22, 32, 37, 0.06);
   border-radius: 18px;
   padding: 14px;
-  transition: transform 160ms ease, border-color 160ms ease, background 160ms ease;
+  transition: border-color 140ms ease, background 140ms ease, box-shadow 140ms ease;
 }
 
 .chat-row:hover,
 .neighbor-row:hover {
-  transform: translateY(-1px);
   border-color: rgba(212, 90, 59, 0.2);
+  box-shadow: 0 8px 24px rgba(52, 41, 26, 0.08);
 }
 
 .chat-row.active {
@@ -256,7 +424,7 @@ button {
 
 .chat-row-head strong,
 .neighbor-row strong {
-  font-size: 0.98rem;
+  font-size: 1rem;
 }
 
 .chat-row-head time,
@@ -264,7 +432,7 @@ button {
 .neighbor-row span,
 .blocked-row span {
   color: var(--muted);
-  font-size: 0.84rem;
+  font-size: 0.88rem;
 }
 
 .chat-row-body em,
@@ -324,6 +492,10 @@ button {
   flex-wrap: wrap;
 }
 
+.stage-topbar h2 {
+  font-size: 1.45rem;
+}
+
 .conversation {
   min-height: 0;
   display: grid;
@@ -376,7 +548,7 @@ button {
 
 .bubble p {
   margin: 0;
-  line-height: 1.6;
+  line-height: 1.68;
   white-space: pre-wrap;
 }
 
@@ -400,6 +572,14 @@ button {
   gap: 10px;
 }
 
+.wrap-row {
+  flex-wrap: wrap;
+}
+
+.top-gap {
+  margin-top: 10px;
+}
+
 .form-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -418,17 +598,106 @@ button {
   color: var(--muted);
 }
 
+.panel-fill {
+  flex: 1 1 0;
+}
+
+.panel-stack {
+  display: grid;
+  gap: 14px;
+}
+
+.action-stack {
+  display: grid;
+  gap: 10px;
+}
+
+.action-stack > button {
+  width: 100%;
+}
+
+.panel-copy {
+  margin: 0;
+  line-height: 1.5;
+  color: var(--muted);
+}
+
+.info-grid {
+  display: grid;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.info-grid-compact {
+  margin-bottom: 0;
+}
+
+.info-grid div {
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+}
+
+.info-grid span {
+  display: block;
+  margin-bottom: 4px;
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+
+.info-grid strong {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.block-controls {
+  margin: 18px 0 28px;
+}
+
+.peer-panel,
+.action-panel {
+  gap: 2px;
+}
+
+.peer-card {
+  border-radius: 20px;
+  padding: 16px;
+  margin-bottom: 14px;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.9), rgba(246, 239, 225, 0.8));
+  border: 1px solid rgba(22, 32, 37, 0.08);
+}
+
+.peer-card-label {
+  margin: 0 0 8px;
+  font-size: 0.74rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.peer-card h3 {
+  margin: 0 0 8px;
+  font-size: 1.15rem;
+  line-height: 1.15;
+}
+
+.peer-card p:last-child {
+  margin: 0;
+  line-height: 1.45;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
 button {
   border-radius: 16px;
   background: var(--accent);
   color: white;
   padding: 12px 16px;
   font-weight: 600;
-  transition: transform 160ms ease, opacity 160ms ease;
+  transition: opacity 140ms ease, background 140ms ease, box-shadow 140ms ease;
 }
 
 button:hover {
-  transform: translateY(-1px);
+  box-shadow: 0 8px 20px rgba(52, 41, 26, 0.12);
 }
 
 button:disabled {
@@ -496,6 +765,7 @@ button.danger {
     grid-column: 1 / -1;
     display: grid;
     grid-template-columns: repeat(3, minmax(0, 1fr));
+    overflow: auto;
   }
 }
 
@@ -515,6 +785,10 @@ button.danger {
 
   .stage {
     min-height: 70vh;
+  }
+
+  body {
+    overflow: auto;
   }
 
   .form-grid {
@@ -542,5 +816,9 @@ button.danger {
   .button-row,
   .inline-form {
     flex-direction: column;
+  }
+
+  .profile-editor {
+    grid-template-columns: 1fr;
   }
 }

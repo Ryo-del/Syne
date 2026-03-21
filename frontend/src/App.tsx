@@ -26,8 +26,16 @@ import type {
   UIMessage,
 } from "./types";
 
+const EMPTY_CONTACT: Contact = {
+  name: "",
+  peer_id: "",
+  ip: "192.168.",
+  port: "",
+};
+
 const EMPTY_SNAPSHOT: Snapshot = {
   local_id: "",
+  local_display_id: "",
   port: 0,
   contacts: [],
   blocked: [],
@@ -59,6 +67,26 @@ function splitAddress(addr?: string) {
   };
 }
 
+function buildEmptyContact(overrides?: Partial<Contact>): Contact {
+  return {
+    ...EMPTY_CONTACT,
+    ...overrides,
+  };
+}
+
+function buildContactDraft(chat: ChatSummary | null, fallbackAddr?: string): Contact {
+  if (!chat) {
+    return buildEmptyContact();
+  }
+  const { ip, port } = splitAddress(chat.known_addr || fallbackAddr);
+  return buildEmptyContact({
+    name: chat.title !== chat.peer_id ? chat.title : "",
+    peer_id: chat.peer_id,
+    ip: ip || EMPTY_CONTACT.ip,
+    port,
+  });
+}
+
 function upsertChat(chats: ChatSummary[], incoming: ChatSummary) {
   const next = chats.filter((item) => item.chat_id !== incoming.chat_id);
   next.unshift(incoming);
@@ -71,6 +99,46 @@ function upsertChat(chats: ChatSummary[], incoming: ChatSummary) {
   return next;
 }
 
+function upsertNeighbor(snapshot: Snapshot, incoming: Snapshot["neighbors"][number]) {
+  const neighbors = snapshot.neighbors
+    .filter((item) => item.peer_id !== incoming.peer_id)
+    .concat(incoming)
+    .sort((a, b) => b.last_seen - a.last_seen);
+  const hasContactAlias = snapshot.contacts.some(
+    (item) => item.peer_id === incoming.peer_id && item.name,
+  );
+  const chats = snapshot.chats.map((chat) => {
+    if (chat.peer_id !== incoming.peer_id) {
+      return chat;
+    }
+    return {
+      ...chat,
+      known_addr: incoming.addr,
+      online: true,
+      title: hasContactAlias ? chat.title : incoming.name || chat.title,
+    };
+  });
+  return {
+    ...snapshot,
+    neighbors,
+    chats,
+  };
+}
+
+function describeError(err: unknown, fallback: string) {
+  if (err instanceof Error) {
+    const message = err.message.trim();
+    if (
+      !message ||
+      message === "The string did not match the expected pattern."
+    ) {
+      return fallback;
+    }
+    return message;
+  }
+  return fallback;
+}
+
 export default function App() {
   const [snapshot, setSnapshot] = useState<Snapshot>(EMPTY_SNAPSHOT);
   const [selectedChatId, setSelectedChatId] = useState("");
@@ -80,18 +148,21 @@ export default function App() {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
-  const [contactForm, setContactForm] = useState<Contact>({
-    name: "",
-    peer_id: "",
-    ip: "",
-    port: "",
-  });
+  const [showAddContact, setShowAddContact] = useState(false);
+  const [contactForm, setContactForm] = useState<Contact>(EMPTY_CONTACT);
   const [renameValue, setRenameValue] = useState("");
   const [blockReason, setBlockReason] = useState("");
   const deferredQuery = useDeferredValue(query);
 
   const selectedChat = snapshot.chats.find((item) => item.chat_id === selectedChatId) ?? null;
+  const selectedContact = selectedChat
+    ? snapshot.contacts.find((item) => item.peer_id === selectedChat.peer_id) ?? null
+    : null;
+  const selectedPeer = selectedChat
+    ? snapshot.neighbors.find((item) => item.peer_id === selectedChat.peer_id) ?? null
+    : null;
   const selectedMessages = selectedChat ? messages[selectedChat.chat_id] ?? [] : [];
+  const selectedAddr = selectedChat?.known_addr || selectedPeer?.addr || "";
   const filteredChats = snapshot.chats.filter((item) => {
     const needle = deferredQuery.trim().toLowerCase();
     if (!needle) {
@@ -142,7 +213,7 @@ export default function App() {
         if (!mounted) {
           return;
         }
-        setError(err instanceof Error ? err.message : "Failed to reach backend");
+        setError(describeError(err, "Failed to reach local backend"));
       } finally {
         if (mounted) {
           setLoading(false);
@@ -165,50 +236,60 @@ export default function App() {
   }, [selectedChatId]);
 
   useEffect(() => {
-    const stop = listenEvents((event: AppEvent) => {
-      if (event.error) {
-        setError(event.error);
-      }
+    let stop: () => void = () => {};
+    try {
+      stop = listenEvents((event: AppEvent) => {
+        if (event.error) {
+          setError(event.error);
+        }
 
-      if (event.message) {
-        startTransition(() => {
-          setMessages((current) => {
-            const existing = current[event.message!.chat_id] ?? [];
-            const nextItems = existing.some(
-              (item) => item.message_id && item.message_id === event.message!.message_id,
-            )
-              ? existing
-              : [...existing, event.message!];
-            return {
-              ...current,
-              [event.message!.chat_id]: nextItems.sort(
-                (a, b) => a.timestamp - b.timestamp,
-              ),
-            };
+        if (event.message) {
+          startTransition(() => {
+            setMessages((current) => {
+              const existing = current[event.message!.chat_id] ?? [];
+              const nextItems = existing.some(
+                (item) => item.message_id && item.message_id === event.message!.message_id,
+              )
+                ? existing
+                : [...existing, event.message!];
+              return {
+                ...current,
+                [event.message!.chat_id]: nextItems.sort(
+                  (a, b) => a.timestamp - b.timestamp,
+                ),
+              };
+            });
           });
-        });
-      }
+        }
 
-      if (event.chat) {
-        startTransition(() => {
-          setSnapshot((current) => ({
-            ...current,
-            chats: upsertChat(current.chats, event.chat!),
-          }));
-        });
-      }
+        if (event.chat) {
+          startTransition(() => {
+            setSnapshot((current) => ({
+              ...current,
+              chats: upsertChat(current.chats, event.chat!),
+            }));
+          });
+        }
 
-      if (
-        event.type === "peer_discovered" ||
-        event.type === "contact_added" ||
-        event.type === "contact_updated" ||
-        event.type === "contact_deleted" ||
-        event.type === "peer_blocked" ||
-        event.type === "peer_unblocked"
-      ) {
-        void refreshBootstrap();
-      }
-    });
+        if (event.type === "peer_discovered" && event.peer) {
+          startTransition(() => {
+            setSnapshot((current) => upsertNeighbor(current, event.peer!));
+          });
+        }
+
+        if (
+          event.type === "contact_added" ||
+          event.type === "contact_updated" ||
+          event.type === "contact_deleted" ||
+          event.type === "peer_blocked" ||
+          event.type === "peer_unblocked"
+        ) {
+          void refreshBootstrap();
+        }
+      });
+    } catch (err) {
+      setError(describeError(err, "Live updates are unavailable"));
+    }
 
     return () => {
       stop();
@@ -217,23 +298,13 @@ export default function App() {
 
   useEffect(() => {
     if (!selectedChat) {
-      setContactForm({ name: "", peer_id: "", ip: "", port: "" });
       setRenameValue("");
       setBlockReason("");
       return;
     }
-    const contact = snapshot.contacts.find(
-      (item) => item.peer_id === selectedChat.peer_id,
-    );
-    const { ip, port } = splitAddress(selectedChat.known_addr);
-    setContactForm({
-      name: contact?.name ?? selectedChat.title,
-      peer_id: selectedChat.peer_id,
-      ip: contact?.ip ?? ip,
-      port: contact?.port ?? port,
-    });
-    setRenameValue(contact?.name ?? selectedChat.title);
-  }, [selectedChat, snapshot.contacts]);
+    setRenameValue(selectedContact?.name ?? selectedChat.title);
+    setBlockReason("");
+  }, [selectedChat, selectedContact]);
 
   async function handleOpenPeer(peerId: string, peerAddr?: string, name?: string) {
     try {
@@ -252,7 +323,7 @@ export default function App() {
       });
       await refreshMessages(chat.chat_id);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to open chat");
+      setError(describeError(err, "Failed to open chat"));
     }
   }
 
@@ -271,7 +342,7 @@ export default function App() {
       });
     } catch (err) {
       setComposer(text);
-      setError(err instanceof Error ? err.message : "Failed to send message");
+      setError(describeError(err, "Failed to send message"));
     }
   }
 
@@ -283,15 +354,12 @@ export default function App() {
     try {
       setSaving(true);
       setError("");
-      const saved = await saveContact(contactForm);
-      await handleOpenPeer(
-        saved.peer_id,
-        `${saved.ip}:${saved.port}`,
-        saved.name,
-      );
+      await saveContact(contactForm);
       await refreshBootstrap();
+      setShowAddContact(false);
+      setContactForm(buildEmptyContact());
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to save contact");
+      setError(describeError(err, "Failed to save contact"));
     } finally {
       setSaving(false);
     }
@@ -307,7 +375,7 @@ export default function App() {
       await renameContact(selectedChat.peer_id, renameValue.trim());
       await refreshBootstrap();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to rename contact");
+      setError(describeError(err, "Failed to rename contact"));
     } finally {
       setSaving(false);
     }
@@ -323,7 +391,7 @@ export default function App() {
       await deleteContact(selectedChat.peer_id);
       await refreshBootstrap();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to delete contact");
+      setError(describeError(err, "Failed to delete contact"));
     } finally {
       setSaving(false);
     }
@@ -342,7 +410,7 @@ export default function App() {
       });
       await refreshBootstrap();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to block peer");
+      setError(describeError(err, "Failed to block peer"));
     } finally {
       setSaving(false);
     }
@@ -355,38 +423,37 @@ export default function App() {
       await unblockPeer(peerId);
       await refreshBootstrap();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to unblock peer");
+      setError(describeError(err, "Failed to unblock peer"));
     } finally {
       setSaving(false);
     }
   }
 
+  function openManualContactForm() {
+    setShowAddContact(true);
+    setContactForm(buildEmptyContact());
+  }
+
+  function openSelectedContactForm() {
+    setShowAddContact(true);
+    setContactForm(buildContactDraft(selectedChat, selectedAddr));
+  }
+
   return (
     <div className="app-shell">
       <aside className="rail rail-left">
-        <section className="brand-card">
-          <p className="eyebrow">P2P messenger</p>
-          <h1>Syne</h1>
-          <p className="brand-copy">
-            Desktop shell over the local Go core. No relay, no cloud, just LAN.
-          </p>
-          <dl className="brand-meta">
-            <div>
-              <dt>Peer</dt>
-              <dd>{snapshot.local_id || "pending"}</dd>
-            </div>
-            <div>
-              <dt>Port</dt>
-              <dd>{snapshot.port || "..."}</dd>
-            </div>
-            <div>
-              <dt>Bridge</dt>
-              <dd>{getApiBase()}</dd>
-            </div>
-          </dl>
+        <section className="profile-strip">
+          <div className="avatar-badge" aria-hidden="true">
+            🙂
+          </div>
+          <div className="profile-copy-block">
+            <p className="eyebrow">You</p>
+            <h2>{snapshot.local_display_id || snapshot.local_id || "Pending"}</h2>
+            <p>{snapshot.chats.length} chats · {snapshot.neighbors.length} nearby peers</p>
+          </div>
         </section>
 
-        <section className="panel">
+        <section className="panel panel-fill">
           <div className="panel-head">
             <h2>Chats</h2>
             <span>{snapshot.chats.length}</span>
@@ -424,9 +491,9 @@ export default function App() {
           </div>
         </section>
 
-        <section className="panel">
+        <section className="panel panel-fill">
           <div className="panel-head">
-            <h2>Radar</h2>
+            <h2>Nearby peers</h2>
             <span>{snapshot.neighbors.length}</span>
           </div>
           <div className="neighbor-list">
@@ -461,7 +528,7 @@ export default function App() {
                 {selectedChat.online ? "online" : "known peer"}
               </span>
               <span className={selectedChat.blocked ? "pill danger" : "pill"}>
-                {selectedChat.blocked ? "blocked" : selectedChat.peer_id}
+                {selectedChat.blocked ? "blocked" : "mesh peer"}
               </span>
             </div>
           ) : null}
@@ -483,7 +550,9 @@ export default function App() {
                   >
                     <header>
                       <strong>
-                        {message.direction === "outgoing" ? "You" : message.from}
+                        {message.direction === "outgoing"
+                          ? "You"
+                          : message.from_name || selectedChat.title || message.from}
                       </strong>
                       <time>{formatTime(message.timestamp)}</time>
                     </header>
@@ -515,145 +584,147 @@ export default function App() {
           ) : (
             <div className="empty-state">
               <h3>No active conversation</h3>
-              <p>Pick a contact or a discovered peer from the left rail.</p>
+              <p>Pick a chat or open a nearby peer from the left rail.</p>
             </div>
           )}
         </section>
       </main>
 
       <aside className="rail rail-right">
-        <section className="panel accent">
-          <div className="panel-head">
-            <h2>Contact card</h2>
-            <span>{selectedChat?.peer_id ?? "new"}</span>
-          </div>
-          <div className="form-grid">
-            <label>
-              <span>Name</span>
-              <input
-                value={contactForm.name}
-                onChange={(event) =>
-                  setContactForm((current) => ({
-                    ...current,
-                    name: event.target.value,
-                  }))
-                }
-              />
-            </label>
-            <label>
-              <span>Peer ID</span>
-              <input
-                value={contactForm.peer_id}
-                onChange={(event) =>
-                  setContactForm((current) => ({
-                    ...current,
-                    peer_id: event.target.value,
-                  }))
-                }
-              />
-            </label>
-            <label>
-              <span>IP</span>
-              <input
-                value={contactForm.ip}
-                onChange={(event) =>
-                  setContactForm((current) => ({
-                    ...current,
-                    ip: event.target.value,
-                  }))
-                }
-              />
-            </label>
-            <label>
-              <span>Port</span>
-              <input
-                value={contactForm.port}
-                onChange={(event) =>
-                  setContactForm((current) => ({
-                    ...current,
-                    port: event.target.value,
-                  }))
-                }
-              />
-            </label>
-          </div>
-          <div className="button-row">
-            <button disabled={saving} onClick={() => void handleSaveContact()}>
-              Save contact
-            </button>
-            <button
-              className="ghost"
-              disabled={saving || !selectedChat}
-              onClick={() => void handleDeleteContact()}
-            >
-              Delete
-            </button>
-          </div>
-        </section>
+        {selectedChat ? (
+          <>
+            {/* Блок 1: Основная информация (Профиль) */}
+            <section className="profile-details-hero">
+              <div className="avatar-large">🙂</div>
+              <h2>{selectedChat.title}</h2>
+              <span className="status-indicator">
+                {selectedChat.online ? "● Online" : "○ Offline"}
+              </span>
+              <div className="peer-id-badge" onClick={() => navigator.clipboard.writeText(selectedChat.peer_id)}>
+                <code>{selectedChat.peer_id}</code>
+              </div>
+            </section>
 
-        <section className="panel">
-          <div className="panel-head">
-            <h2>Rename</h2>
-            <span>local alias</span>
-          </div>
-          <div className="inline-form">
-            <input
-              placeholder="Visible name"
-              value={renameValue}
-              onChange={(event) => setRenameValue(event.target.value)}
-            />
-            <button disabled={saving || !selectedChat} onClick={() => void handleRename()}>
-              Update
-            </button>
-          </div>
-        </section>
-
-        <section className="panel warning">
-          <div className="panel-head">
-            <h2>Blocklist</h2>
-            <span>{snapshot.blocked.length}</span>
-          </div>
-          <div className="inline-form">
-            <input
-              placeholder="Reason"
-              value={blockReason}
-              onChange={(event) => setBlockReason(event.target.value)}
-            />
-            <button
-              className="danger"
-              disabled={saving || !selectedChat}
-              onClick={() => void handleBlock()}
-            >
-              Block peer
-            </button>
-          </div>
-          <div className="blocked-list">
-            {snapshot.blocked.map((item) => (
-              <div key={item.peer_id} className="blocked-row">
-                <div>
-                  <strong>{item.name || item.peer_id}</strong>
-                  <span>{item.reason || "no reason"}</span>
-                </div>
-                <button className="ghost" onClick={() => void handleUnblock(item.peer_id)}>
-                  Unblock
+            {/* Блок 2: Управление контактом */}
+            <section className="panel action-panel">
+              <div className="panel-head">
+                <h2>{selectedContact ? "Contact Info" : "New Peer"}</h2>
+                <button 
+                  className="ghost-tiny" 
+                  onClick={() => setShowAddContact(!showAddContact)}
+                >
+                  {showAddContact ? "Close" : "Edit / Add"}
                 </button>
               </div>
-            ))}
-            {!snapshot.blocked.length ? (
-              <div className="empty-state compact">Blocklist is empty.</div>
-            ) : null}
-          </div>
-        </section>
 
-        {error ? (
-          <section className="panel error-panel">
+              {!showAddContact ? (
+                <div className="contact-summary">
+                  <div className="info-row">
+                    <span>Address</span>
+                    <strong>{selectedAddr || "Unknown"}</strong>
+                  </div>
+                  {!selectedContact && (
+                    <button className="primary-action" onClick={openSelectedContactForm}>
+                      Add to Contacts
+                    </button>
+                  )}
+                </div>
+              ) : (
+                <div className="form-grid">
+                  <label>
+                    <span>Display Name</span>
+                    <input
+                      value={contactForm.name}
+                      onChange={(e) => setContactForm({ ...contactForm, name: e.target.value })}
+                    />
+                  </label>
+                  <div className="form-row">
+                    <label>
+                      <span>IP</span>
+                      <input
+                        value={contactForm.ip}
+                        onChange={(e) => setContactForm({ ...contactForm, ip: e.target.value })}
+                      />
+                    </label>
+                    <label>
+                      <span>Port</span>
+                      <input
+                        className="port-input"
+                        value={contactForm.port}
+                        onChange={(e) => setContactForm({ ...contactForm, port: e.target.value })}
+                      />
+                    </label>
+                  </div>
+                  <div className="action-stack">
+                    <button className="solid" disabled={saving} onClick={() => void handleSaveContact()}>
+                      Save Changes
+                    </button>
+                  </div>
+                </div>
+              )}
+            </section>
+
+            {/* Блок 3: Безопасность и Блокировка */}
+            <section className="panel action-panel danger-zone">
+              <div className="panel-head">
+                <h2>Privacy</h2>
+              </div>
+              <div className="inline-form block-controls">
+                <input
+                  placeholder="Reason for blocking..."
+                  value={blockReason}
+                  onChange={(event) => setBlockReason(event.target.value)}
+                />
+                <button
+                  className="danger-btn"
+                  disabled={saving}
+                  onClick={() => void handleBlock()}
+                >
+                  Block
+                </button>
+              </div>
+              
+              {selectedContact && (
+                <button
+                  className="ghost-danger-link"
+                  disabled={saving}
+                  onClick={() => void handleDeleteContact()}
+                >
+                  Delete Contact
+                </button>
+              )}
+            </section>
+          </>
+        ) : (
+          <div className="empty-state">
+            <h3>No peer selected</h3>
+            <p>Select a chat to manage connection</p>
+          </div>
+        )}
+
+        {/* Список заблокированных — теперь компактный в самом низу */}
+        {snapshot.blocked.length > 0 && (
+          <section className="panel blocked-panel-mini">
             <div className="panel-head">
-              <h2>Backend</h2>
-              <span>attention</span>
+              <h2>Blocked list</h2>
+              <span>{snapshot.blocked.length}</span>
             </div>
-            <p>{error}</p>
+            <div className="blocked-scroll">
+              {snapshot.blocked.map((item) => (
+                <div key={item.peer_id} className="blocked-row-mini">
+                  <span>{item.name || "Unknown"}</span>
+                  <button onClick={() => void handleUnblock(item.peer_id)}>Unblock</button>
+                </div>
+              ))}
+            </div>
           </section>
-        ) : null}
+        )}
+
+        {error && (
+          <div className="error-toast">
+            <strong>Error:</strong> {error}
+          </div>
+        )}
       </aside>
     </div>
   );

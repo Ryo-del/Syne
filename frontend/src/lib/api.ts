@@ -3,6 +3,7 @@ import type {
   BlockedPeer,
   ChatSummary,
   Contact,
+  Profile,
   Snapshot,
   UIMessage,
 } from "../types";
@@ -14,8 +15,16 @@ export function getApiBase() {
   return API_BASE;
 }
 
+function buildUrl(path: string) {
+  try {
+    return new URL(path, API_BASE).toString();
+  } catch {
+    throw new Error("Bridge address is invalid. Check the local backend.");
+  }
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`${API_BASE}${path}`, {
+  const response = await fetch(buildUrl(path), {
     headers: {
       "Content-Type": "application/json",
       ...(init?.headers ?? {}),
@@ -44,6 +53,13 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 export function loadBootstrap() {
   return request<Snapshot>("/api/bootstrap");
+}
+
+export function updateProfile(displayId: string) {
+  return request<Profile>("/api/profile", {
+    method: "PATCH",
+    body: JSON.stringify({ display_id: displayId }),
+  });
 }
 
 export function loadMessages(chatId: string) {
@@ -115,7 +131,7 @@ export function unblockPeer(query: string) {
 }
 
 export function listenEvents(onEvent: (event: AppEvent) => void) {
-  const source = new EventSource(`${API_BASE}/api/events`);
+  const source = new EventSource(buildUrl("/api/events"));
 
   const forward = (nativeEvent: MessageEvent<string>) => {
     try {
@@ -124,6 +140,8 @@ export function listenEvents(onEvent: (event: AppEvent) => void) {
       return;
     }
   };
+
+  source.onerror = () => undefined;
 
   source.addEventListener("peer_discovered", forward as EventListener);
   source.addEventListener("message_received", forward as EventListener);
