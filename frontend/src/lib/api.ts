@@ -55,10 +55,10 @@ export function loadBootstrap() {
   return request<Snapshot>("/api/bootstrap");
 }
 
-export function updateProfile(displayId: string) {
+export function setPeerId(peerId: string) {
   return request<Profile>("/api/profile", {
     method: "PATCH",
-    body: JSON.stringify({ display_id: displayId }),
+    body: JSON.stringify({ peer_id: peerId }),
   });
 }
 

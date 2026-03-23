@@ -125,20 +125,21 @@ func (s *server) handleProfile(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]string{
-			"local_id":         snapshot.LocalID,
-			"local_display_id": snapshot.LocalDisplayID,
+			"local_id": snapshot.LocalID,
 		})
 	case http.MethodPatch:
 		var req struct {
-			DisplayID string `json:"display_id"`
+			PeerID string `json:"peer_id"`
 		}
 		if err := decodeJSON(r, &req); err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		if err := s.service.UpdateLocalDisplayID(req.DisplayID); err != nil {
-			writeError(w, http.StatusBadRequest, err.Error())
-			return
+		if strings.TrimSpace(req.PeerID) != "" {
+			if err := s.service.UpdateLocalPeerID(req.PeerID); err != nil {
+				writeError(w, http.StatusBadRequest, err.Error())
+				return
+			}
 		}
 		snapshot, err := s.service.Snapshot()
 		if err != nil {
@@ -146,8 +147,7 @@ func (s *server) handleProfile(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]string{
-			"local_id":         snapshot.LocalID,
-			"local_display_id": snapshot.LocalDisplayID,
+			"local_id": snapshot.LocalID,
 		})
 	default:
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")

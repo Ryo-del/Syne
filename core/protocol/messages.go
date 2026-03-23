@@ -33,14 +33,13 @@ type Message struct {
 	Target  TargetType  `json:"target"`
 
 	MessageID string `json:"message_id,omitempty"`
-	HopTTL   int    `json:"ttl,omitempty"`
-	TargetID string `json:"target_id"`
-	ChatID   string `json:"chat_id"`
-	From     string `json:"from"`
-	FromName string `json:"from_name,omitempty"`
-	FromPub  []byte `json:"from_pub,omitempty"` // X25519 public key (32 bytes) for key agreement/handshake
-	Payload  []byte `json:"payload"`
-	Nonce    []byte `json:"nonce,omitempty"` // для MsgChat: nonce шифрования (если есть — Payload зашифрован)
+	HopTTL    int    `json:"ttl,omitempty"`
+	TargetID  string `json:"target_id"`
+	ChatID    string `json:"chat_id"`
+	From      string `json:"from"`
+	FromPub   []byte `json:"from_pub,omitempty"` // X25519 public key (32 bytes) for key agreement/handshake
+	Payload   []byte `json:"payload"`
+	Nonce     []byte `json:"nonce,omitempty"` // для MsgChat: nonce шифрования (если есть — Payload зашифрован)
 
 	Timestamp int64 `json:"timestamp"`
 }

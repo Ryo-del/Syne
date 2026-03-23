@@ -23,19 +23,17 @@ import (
 const defaultHopTTL = 4
 
 type Config struct {
-	LocalID        string `json:"local_id"`
-	LocalDisplayID string `json:"local_display_id"`
-	Port           int    `json:"port"`
+	LocalID string `json:"local_id"`
+	Port    int    `json:"port"`
 }
 
 type Snapshot struct {
-	LocalID        string                 `json:"local_id"`
-	LocalDisplayID string                 `json:"local_display_id"`
-	Port           int                    `json:"port"`
-	Contacts       []corechat.Contact     `json:"contacts"`
-	Blocked        []corechat.BlockedPeer `json:"blocked"`
-	Neighbors      []PeerPresence         `json:"neighbors"`
-	Chats          []ChatSummary          `json:"chats"`
+	LocalID   string                 `json:"local_id"`
+	Port      int                    `json:"port"`
+	Contacts  []corechat.Contact     `json:"contacts"`
+	Blocked   []corechat.BlockedPeer `json:"blocked"`
+	Neighbors []PeerPresence         `json:"neighbors"`
+	Chats     []ChatSummary          `json:"chats"`
 }
 
 type PeerPresence struct {
@@ -63,7 +61,6 @@ type UIMessage struct {
 	ChatID    string `json:"chat_id"`
 	TargetID  string `json:"target_id"`
 	From      string `json:"from"`
-	FromName  string `json:"from_name,omitempty"`
 	Text      string `json:"text"`
 	Timestamp int64  `json:"timestamp"`
 	Direction string `json:"direction"`
@@ -96,13 +93,13 @@ type Service struct {
 	identityPriv *ecdh.PrivateKey
 	identityPub  []byte
 
-	stateMu    sync.RWMutex
-	neighbors  map[string]PeerPresence
-	displayIDs map[string]string
-	peerPubs   map[string]*ecdh.PublicKey
-	seen       map[string]time.Time
-	unread     map[string]int
-	rateStates map[string]*rateState
+	stateMu          sync.RWMutex
+	neighbors        map[string]PeerPresence
+	peerPubs         map[string]*ecdh.PublicKey
+	seen             map[string]time.Time
+	unread           map[string]int
+	rateStates       map[string]*rateState
+	discoveryStarted bool
 
 	subMu       sync.RWMutex
 	subscribers map[chan Event]struct{}
@@ -117,24 +114,17 @@ func New(config Config) (*Service, error) {
 	}
 
 	localID := strings.TrimSpace(config.LocalID)
+
 	if localID == "" {
 		localID = strings.TrimSpace(profile.ID)
 	}
-	if localID == "" {
-		localID = uuid.NewString()
-	}
-	localDisplayID := strings.TrimSpace(config.LocalDisplayID)
-	if localDisplayID == "" {
-		localDisplayID = strings.TrimSpace(profile.DisplayID)
-	}
-	if localDisplayID == "" {
-		localDisplayID = localID
-	}
-	if err := corechat.SaveUserProfile(corechat.UserData{
-		ID:        localID,
-		DisplayID: localDisplayID,
-	}); err != nil {
-		return nil, err
+
+	if localID != "" {
+		if err := corechat.SaveUserProfile(corechat.UserData{
+			ID: localID,
+		}); err != nil {
+			return nil, err
+		}
 	}
 
 	port := config.Port
@@ -157,16 +147,14 @@ func New(config Config) (*Service, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Service{
 		cfg: Config{
-			LocalID:        localID,
-			LocalDisplayID: localDisplayID,
-			Port:           port,
+			LocalID: localID,
+			Port:    port,
 		},
 		ctx:          ctx,
 		cancel:       cancel,
 		identityPriv: identityPriv,
 		identityPub:  identityPub,
 		neighbors:    make(map[string]PeerPresence),
-		displayIDs:   make(map[string]string),
 		peerPubs:     make(map[string]*ecdh.PublicKey),
 		seen:         make(map[string]time.Time),
 		unread:       make(map[string]int),
@@ -182,17 +170,10 @@ func (s *Service) Start() error {
 	}
 	s.listener = listener
 
-	if err := discovery.StartLANDiscovery(
-		s.ctx,
-		s.cfg.LocalID,
-		s.localDisplayID,
-		s.cfg.Port,
-		s.registerNeighbor,
-	); err != nil {
+	if err := s.startDiscoveryIfNeeded(); err != nil {
 		_ = listener.Close()
 		return err
 	}
-
 	s.wg.Add(1)
 	go s.acceptLoop()
 	return nil
@@ -242,13 +223,12 @@ func (s *Service) Snapshot() (Snapshot, error) {
 	}
 
 	return Snapshot{
-		LocalID:        s.cfg.LocalID,
-		LocalDisplayID: s.localDisplayID(),
-		Port:           s.cfg.Port,
-		Contacts:       contacts,
-		Blocked:        blocked,
-		Neighbors:      neighbors,
-		Chats:          chats,
+		LocalID:   s.cfg.LocalID,
+		Port:      s.cfg.Port,
+		Contacts:  contacts,
+		Blocked:   blocked,
+		Neighbors: neighbors,
+		Chats:     chats,
 	}, nil
 }
 
@@ -281,17 +261,14 @@ func (s *Service) ListMessages(chatID string) ([]UIMessage, error) {
 	messages := make([]UIMessage, 0, len(items))
 	for _, item := range items {
 		direction := "incoming"
-		fromName := s.lookupPeerDisplay(item.From)
 		if item.From == s.cfg.LocalID {
 			direction = "outgoing"
-			fromName = s.localDisplayID()
 		}
 		messages = append(messages, UIMessage{
 			MessageID: item.MessageID,
 			ChatID:    item.ChatID,
 			TargetID:  item.TargetID,
 			From:      item.From,
-			FromName:  fromName,
 			Text:      string(item.Payload),
 			Timestamp: item.Timestamp,
 			Direction: direction,
@@ -307,6 +284,9 @@ func (s *Service) ListMessages(chatID string) ([]UIMessage, error) {
 }
 
 func (s *Service) OpenPrivateChat(peerID, peerAddr, name string) (ChatSummary, error) {
+	if strings.TrimSpace(s.cfg.LocalID) == "" {
+		return ChatSummary{}, fmt.Errorf("peer_id is not configured yet")
+	}
 	peerID = strings.TrimSpace(peerID)
 	peerAddr = strings.TrimSpace(peerAddr)
 	name = strings.TrimSpace(name)
@@ -322,7 +302,7 @@ func (s *Service) OpenPrivateChat(peerID, peerAddr, name string) (ChatSummary, e
 	chatID := privateChatID(s.cfg.LocalID, peerID)
 	title := name
 	if title == "" {
-		title = s.lookupPeerDisplay(peerID)
+		title = s.lookupPeerTitle(peerID)
 	}
 
 	if err := history.TouchChat(history.ChatRecord{
@@ -359,6 +339,9 @@ func (s *Service) OpenPrivateChat(peerID, peerAddr, name string) (ChatSummary, e
 }
 
 func (s *Service) SendMessage(chatID, targetID, text string) (UIMessage, error) {
+	if strings.TrimSpace(s.cfg.LocalID) == "" {
+		return UIMessage{}, fmt.Errorf("peer_id is not configured yet")
+	}
 	chatID = strings.TrimSpace(chatID)
 	targetID = strings.TrimSpace(targetID)
 	text = strings.TrimSpace(text)
@@ -380,7 +363,6 @@ func (s *Service) SendMessage(chatID, targetID, text string) (UIMessage, error) 
 		TargetID:  targetID,
 		ChatID:    chatID,
 		From:      s.cfg.LocalID,
-		FromName:  s.localDisplayID(),
 		Payload:   []byte(text),
 		Timestamp: time.Now().UnixMilli(),
 	}
@@ -390,7 +372,7 @@ func (s *Service) SendMessage(chatID, targetID, text string) (UIMessage, error) 
 	if err := history.TouchChat(history.ChatRecord{
 		ChatID:        chatID,
 		PeerID:        targetID,
-		Title:         s.lookupPeerDisplay(targetID),
+		Title:         s.lookupPeerTitle(targetID),
 		LastMessage:   text,
 		LastTimestamp: msg.Timestamp,
 	}); err != nil {
@@ -427,7 +409,6 @@ func (s *Service) SendMessage(chatID, targetID, text string) (UIMessage, error) 
 		ChatID:    msg.ChatID,
 		TargetID:  msg.TargetID,
 		From:      msg.From,
-		FromName:  s.localDisplayID(),
 		Text:      text,
 		Timestamp: msg.Timestamp,
 		Direction: "outgoing",
@@ -554,21 +535,30 @@ func (s *Service) UnblockPeer(query string) error {
 	return nil
 }
 
-func (s *Service) UpdateLocalDisplayID(displayID string) error {
-	displayID = strings.TrimSpace(displayID)
-	if displayID == "" {
-		return fmt.Errorf("display_id is required")
+func (s *Service) UpdateLocalPeerID(peerID string) error {
+	peerID = strings.TrimSpace(peerID)
+	if err := validatePeerID(peerID); err != nil {
+		return err
 	}
 
 	s.stateMu.Lock()
-	localID := s.cfg.LocalID
-	s.cfg.LocalDisplayID = displayID
+	if strings.TrimSpace(s.cfg.LocalID) != "" {
+		s.stateMu.Unlock()
+		return fmt.Errorf("peer_id is already set")
+	}
+	s.cfg.LocalID = peerID
 	s.stateMu.Unlock()
 
-	return corechat.SaveUserProfile(corechat.UserData{
-		ID:        localID,
-		DisplayID: displayID,
-	})
+	if err := corechat.SaveUserProfile(corechat.UserData{
+		ID: peerID,
+	}); err != nil {
+		s.stateMu.Lock()
+		s.cfg.LocalID = ""
+		s.stateMu.Unlock()
+		return err
+	}
+
+	return s.startDiscoveryIfNeeded()
 }
 
 func (s *Service) acceptLoop() {
@@ -636,11 +626,10 @@ func (s *Service) handleIncoming(msg protocol.Message, sender *net.TCPAddr) {
 		if !s.allowRate(senderKey(sender), now, 8, 16) {
 			return
 		}
-		s.registerNeighbor(msg.From, sender.String(), msg.FromName)
+		s.registerNeighbor(msg.From, sender.String())
 		s.rememberPeerPub(msg.From, msg.FromPub)
 
 		ack := protocol.NewJoinAck(msg.ChatID, s.cfg.LocalID, msg.From)
-		ack.FromName = s.localDisplayID()
 		ack.FromPub = s.identityPub
 		if err := s.sendAck(ack, sender); err != nil {
 			s.emitError(err)
@@ -659,7 +648,7 @@ func (s *Service) handleIncoming(msg protocol.Message, sender *net.TCPAddr) {
 		} else if blocked {
 			return
 		}
-		s.registerNeighbor(msg.From, sender.String(), msg.FromName)
+		s.registerNeighbor(msg.From, sender.String())
 		s.rememberPeerPub(msg.From, msg.FromPub)
 		if summary, err := s.chatSummaryByID(msg.ChatID); err == nil {
 			s.emit(Event{
@@ -685,7 +674,7 @@ func (s *Service) handleIncoming(msg protocol.Message, sender *net.TCPAddr) {
 		if s.isSeen(msg.MessageID, now, 10*time.Minute) {
 			return
 		}
-		s.registerNeighbor(msg.From, sender.String(), msg.FromName)
+		s.registerNeighbor(msg.From, sender.String())
 
 		if msg.TargetID != s.cfg.LocalID {
 			if msg.HopTTL <= 1 {
@@ -727,7 +716,7 @@ func (s *Service) handleIncoming(msg protocol.Message, sender *net.TCPAddr) {
 		if err := history.TouchChat(history.ChatRecord{
 			ChatID:        plainMsg.ChatID,
 			PeerID:        plainMsg.From,
-			Title:         s.lookupPeerDisplay(plainMsg.From),
+			Title:         s.lookupPeerTitle(plainMsg.From),
 			LastMessage:   string(payload),
 			LastTimestamp: plainMsg.Timestamp,
 		}); err != nil {
@@ -743,7 +732,6 @@ func (s *Service) handleIncoming(msg protocol.Message, sender *net.TCPAddr) {
 			ChatID:    plainMsg.ChatID,
 			TargetID:  plainMsg.TargetID,
 			From:      plainMsg.From,
-			FromName:  s.lookupPeerDisplay(plainMsg.From),
 			Text:      string(payload),
 			Timestamp: plainMsg.Timestamp,
 			Direction: "incoming",
@@ -758,21 +746,17 @@ func (s *Service) handleIncoming(msg protocol.Message, sender *net.TCPAddr) {
 	}
 }
 
-func (s *Service) registerNeighbor(peerID, addr, displayID string) {
+func (s *Service) registerNeighbor(peerID, addr string) {
 	peerID = strings.TrimSpace(peerID)
 	addr = strings.TrimSpace(addr)
-	displayID = strings.TrimSpace(displayID)
 	if peerID == "" || peerID == s.cfg.LocalID || addr == "" {
 		return
 	}
 	blocked, _ := corechat.IsBlocked(peerID)
-	if displayID != "" {
-		s.setPeerDisplayID(peerID, displayID)
-	}
 
 	item := PeerPresence{
 		PeerID:   peerID,
-		Name:     s.lookupPeerDisplay(peerID),
+		Name:     s.lookupPeerTitle(peerID),
 		Addr:     addr,
 		LastSeen: time.Now().UnixMilli(),
 		Blocked:  blocked,
@@ -802,12 +786,9 @@ func (s *Service) lookupPeerName(peerID string) string {
 	return ""
 }
 
-func (s *Service) lookupPeerDisplay(peerID string) string {
+func (s *Service) lookupPeerTitle(peerID string) string {
 	if name := s.lookupPeerName(peerID); name != "" {
 		return name
-	}
-	if displayID := s.peerDisplayID(peerID); displayID != "" {
-		return displayID
 	}
 	return peerID
 }
@@ -847,8 +828,6 @@ func (s *Service) listChats() ([]ChatSummary, error) {
 		title := strings.TrimSpace(record.Title)
 		if item, ok := contactMap[record.PeerID]; ok && item.Name != "" {
 			title = item.Name
-		} else if displayID := s.peerDisplayID(record.PeerID); displayID != "" {
-			title = displayID
 		}
 		if title == "" {
 			title = record.PeerID
@@ -912,27 +891,29 @@ func (s *Service) emitError(err error) {
 	})
 }
 
-func (s *Service) localDisplayID() string {
-	s.stateMu.RLock()
-	defer s.stateMu.RUnlock()
-	return firstNonEmpty(s.cfg.LocalDisplayID, s.cfg.LocalID)
-}
-
-func (s *Service) peerDisplayID(peerID string) string {
-	s.stateMu.RLock()
-	defer s.stateMu.RUnlock()
-	return strings.TrimSpace(s.displayIDs[peerID])
-}
-
-func (s *Service) setPeerDisplayID(peerID, displayID string) {
-	peerID = strings.TrimSpace(peerID)
-	displayID = strings.TrimSpace(displayID)
-	if peerID == "" || displayID == "" {
-		return
-	}
+func (s *Service) startDiscoveryIfNeeded() error {
 	s.stateMu.Lock()
-	s.displayIDs[peerID] = displayID
+	if s.discoveryStarted || strings.TrimSpace(s.cfg.LocalID) == "" {
+		s.stateMu.Unlock()
+		return nil
+	}
+	localID := s.cfg.LocalID
+	port := s.cfg.Port
+	s.discoveryStarted = true
 	s.stateMu.Unlock()
+
+	if err := discovery.StartLANDiscovery(
+		s.ctx,
+		localID,
+		port,
+		s.registerNeighbor,
+	); err != nil {
+		s.stateMu.Lock()
+		s.discoveryStarted = false
+		s.stateMu.Unlock()
+		return err
+	}
+	return nil
 }
 
 func (s *Service) rememberPeerPub(peerID string, raw []byte) {
@@ -1022,7 +1003,6 @@ func (s *Service) sendJoin(peerID, peerAddr, chatID string) error {
 		return fmt.Errorf("peer address not found: %s", peerID)
 	}
 	join := protocol.NewJoin(chatID, s.cfg.LocalID, peerID)
-	join.FromName = s.localDisplayID()
 	join.FromPub = s.identityPub
 	return s.sendProtocolMessage(peer, join)
 }
@@ -1101,14 +1081,24 @@ func privateChatID(a, b string) string {
 	return "dm:" + b + ":" + a
 }
 
-func firstNonEmpty(values ...string) string {
-	for _, value := range values {
-		value = strings.TrimSpace(value)
-		if value != "" {
-			return value
+func validatePeerID(peerID string) error {
+	if peerID == "" {
+		return fmt.Errorf("peer_id is required")
+	}
+	if len(peerID) < 3 || len(peerID) > 32 {
+		return fmt.Errorf("peer_id must be 3-32 characters long")
+	}
+	for _, ch := range peerID {
+		isLetter := ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z'
+		isDigit := ch >= '0' && ch <= '9'
+		switch {
+		case isLetter, isDigit, ch == '-', ch == '_', ch == '.':
+			continue
+		default:
+			return fmt.Errorf("peer_id may contain only letters, numbers, dot, dash and underscore")
 		}
 	}
-	return ""
+	return nil
 }
 
 func senderKey(sender *net.TCPAddr) string {

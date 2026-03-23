@@ -19,8 +19,7 @@ type Contact struct {
 }
 
 type UserData struct {
-	ID        string `json:"ID"`
-	DisplayID string `json:"display_id,omitempty"`
+	ID string `json:"ID"`
 }
 
 func (c Contact) Address() string {
@@ -53,25 +52,13 @@ func DeleteContact(query string) error {
 }
 
 func SaveUserData(id string) error {
-	profile, err := GetUserData()
-	if err != nil {
-		return err
-	}
-	profile.ID = strings.TrimSpace(id)
-	if profile.DisplayID == "" {
-		profile.DisplayID = profile.ID
-	}
-	return SaveUserProfile(profile)
+	return SaveUserProfile(UserData{ID: id})
 }
 
 func SaveUserProfile(data UserData) error {
 	data.ID = strings.TrimSpace(data.ID)
-	data.DisplayID = strings.TrimSpace(data.DisplayID)
 	if data.ID == "" {
 		return fmt.Errorf("id is required")
-	}
-	if data.DisplayID == "" {
-		data.DisplayID = data.ID
 	}
 
 	path, err := UserDataFilePath()
@@ -109,10 +96,6 @@ func GetUserData() (UserData, error) {
 		return UserData{}, nil
 	}
 	data.ID = strings.TrimSpace(data.ID)
-	data.DisplayID = strings.TrimSpace(data.DisplayID)
-	if data.DisplayID == "" {
-		data.DisplayID = data.ID
-	}
 	return data, nil
 }
 

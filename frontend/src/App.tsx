@@ -17,6 +17,7 @@ import {
   renameContact,
   saveContact,
   sendMessage,
+  setPeerId,
   unblockPeer,
 } from "./lib/api";
 import type {
@@ -36,7 +37,6 @@ const EMPTY_CONTACT: Contact = {
 
 const EMPTY_SNAPSHOT: Snapshot = {
   local_id: "",
-  local_display_id: "",
   port: 0,
   contacts: [],
   blocked: [],
@@ -166,8 +166,10 @@ export default function App() {
   const [selectedChatId, setSelectedChatId] = useState("");
   const [messages, setMessages] = useState<Record<string, UIMessage[]>>({});
   const [query, setQuery] = useState("");
+  const [localPeerIdDraft, setLocalPeerIdDraft] = useState("");
   const [composer, setComposer] = useState("");
   const [error, setError] = useState("");
+  const [errorToastKey, setErrorToastKey] = useState(0);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [showNewContactPopover, setShowNewContactPopover] = useState(false);
@@ -192,6 +194,7 @@ export default function App() {
   const selectedMessages = selectedChat ? messages[selectedChat.chat_id] ?? [] : [];
   const selectedAddr = selectedChat?.known_addr || selectedPeer?.addr || "";
   const selectedPeerEmoji = selectedChat ? peerEmojis[selectedChat.peer_id] ?? "🙂" : "🙂";
+  const showPeerIdOnboarding = !loading && !snapshot.local_id.trim();
 
   const filteredChats = useMemo(() => {
     const needle = deferredQuery.trim().toLowerCase();
@@ -317,6 +320,19 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    if (!error) {
+      return;
+    }
+    setErrorToastKey((current) => current + 1);
+    const timer = window.setTimeout(() => {
+      setError("");
+    }, 4200);
+    return () => {
+      window.clearTimeout(timer);
+    };
+  }, [error]);
+
+  useEffect(() => {
     if (!selectedChat) {
       setPeerNameDraft("");
       setEditingPeerName(false);
@@ -362,6 +378,24 @@ export default function App() {
     } catch (err) {
       setComposer(text);
       setError(describeError(err, "Failed to send message"));
+    }
+  }
+
+  async function handleSubmitLocalPeerId() {
+    const peerId = localPeerIdDraft.trim();
+    if (!peerId) {
+      setError("Enter a Peer ID");
+      return;
+    }
+    try {
+      setSaving(true);
+      setError("");
+      await setPeerId(peerId);
+      await refreshBootstrap(false);
+    } catch (err) {
+      setError(describeError(err, "Failed to save Peer ID"));
+    } finally {
+      setSaving(false);
     }
   }
 
@@ -493,7 +527,8 @@ export default function App() {
   }
 
   return (
-    <div className="app-shell">
+    <>
+      <div className="app-shell">
       <aside className="rail rail-left">
         <section className="profile-strip">
         <div className="emoji-anchor">
@@ -521,7 +556,7 @@ export default function App() {
 </div>
           <div className="profile-copy-block">
             <p className="eyebrow">You</p>
-            <h2>{snapshot.local_display_id || snapshot.local_id || "Pending"}</h2>
+            <h2>{snapshot.local_id || "Pending"}</h2>
             <p>{snapshot.chats.length} chats · {snapshot.neighbors.length} nearby peers</p>
           </div>
         </section>
@@ -672,7 +707,7 @@ export default function App() {
                     className={`bubble ${message.direction}`}
                   >
                     <header>
-                      <strong>{message.direction === "outgoing" ? "You" : message.from_name || selectedChat.title || message.from}</strong>
+                      <strong>{message.direction === "outgoing" ? "You" : selectedChat.title || message.from}</strong>
                       <time>{formatTime(message.timestamp)}</time>
                     </header>
                     <p>{message.text}</p>
@@ -826,12 +861,45 @@ export default function App() {
     </div>
   </section>
 
-  {error ? (
-    <div className="error-toast">
-      <strong>Error:</strong> {error}
-    </div>
-  ) : null}
 </aside>
-    </div>
+      </div>
+
+      {error ? (
+        <div
+          key={errorToastKey}
+          className="error-toast"
+          role="alert"
+          aria-live="assertive"
+        >
+          <span className="error-toast-title">Error</span>
+          <p>{error}</p>
+        </div>
+      ) : null}
+
+      {showPeerIdOnboarding ? (
+        <div className="onboarding-overlay" role="dialog" aria-modal="true" aria-label="Set peer id">
+          <section className="onboarding-card">
+            <div className="onboarding-emoji" aria-hidden="true">🪪</div>
+            <p className="onboarding-copy">
+            Введите свой PeerID, чтобы другие устройства в сети могли распознать и открыть чат с вами.
+            </p>
+            <input
+              className="onboarding-input"
+              placeholder="Peer ID"
+              value={localPeerIdDraft}
+              autoFocus
+              disabled={saving}
+              onChange={(event) => setLocalPeerIdDraft(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  event.preventDefault();
+                  void handleSubmitLocalPeerId();
+                }
+              }}
+            />
+          </section>
+        </div>
+      ) : null}
+    </>
   );
 }

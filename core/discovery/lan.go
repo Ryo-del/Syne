@@ -15,21 +15,15 @@ const (
 )
 
 // StartLANDiscovery broadcasts our presence and listens for peers on the LAN.
-// onPeer is called with (peerID, addrString, displayID) where addrString is "ip:port".
+// onPeer is called with (peerID, addrString) where addrString is "ip:port".
 func StartLANDiscovery(
 	ctx context.Context,
 	localID string,
-	displayID func() string,
 	tcpPort int,
-	onPeer func(peerID, addr, displayID string),
+	onPeer func(peerID, addr string),
 ) error {
 	if onPeer == nil {
 		return fmt.Errorf("onPeer callback is required")
-	}
-	if displayID == nil {
-		displayID = func() string {
-			return ""
-		}
 	}
 
 	recvConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: DiscoveryPort})
@@ -58,7 +52,7 @@ func StartLANDiscovery(
 			}
 			msg := strings.TrimSpace(string(buf[:n]))
 			parts := strings.Split(msg, "|")
-			if len(parts) < 3 || len(parts) > 4 || parts[0] != DiscoveryMagic {
+			if len(parts) != 3 || parts[0] != DiscoveryMagic {
 				continue
 			}
 			peerID := parts[1]
@@ -69,12 +63,8 @@ func StartLANDiscovery(
 			if err != nil || port <= 0 {
 				continue
 			}
-			label := ""
-			if len(parts) == 4 {
-				label = strings.TrimSpace(parts[3])
-			}
 			addr := net.JoinHostPort(sender.IP.String(), strconv.Itoa(port))
-			onPeer(peerID, addr, label)
+			onPeer(peerID, addr)
 		}
 	}()
 
@@ -88,11 +78,10 @@ func StartLANDiscovery(
 				return
 			case <-ticker.C:
 				payload := fmt.Sprintf(
-					"%s|%s|%d|%s",
+					"%s|%s|%d",
 					DiscoveryMagic,
 					localID,
 					tcpPort,
-					strings.ReplaceAll(strings.TrimSpace(displayID()), "|", " "),
 				)
 				_, _ = sendConn.WriteToUDP([]byte(payload), dst)
 			}
