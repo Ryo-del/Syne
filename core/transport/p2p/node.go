@@ -106,20 +106,29 @@ func NewNode(parent context.Context, identity *corecrypto.Identity, packetHandle
 	}
 	node.host = h
 	node.host.SetStreamHandler(streamProtocol, node.handleStream)
-
-	kad, err := dht.New(
-		ctx,
-		h,
-		dht.Mode(dht.ModeAuto),
-		dht.NamespacedValidator("syne", syneValidator{}),
+	v := record.NamespacedValidator{
+		"pk":   record.PublicKeyValidator{}, // Обязателен для глобальной сети
+		"ipns": syneValidator{},             // IPFS требует этот ключ, подставим наш валидатор
+		"syne": syneValidator{},             // Твой кастомный валидатор
+	}
+	kad, err := dht.New(ctx, h,
+		dht.Mode(dht.ModeServer),
+		dht.Validator(v),
+		dht.ProtocolPrefix("/syne"),
 	)
 	if err != nil {
 		_ = h.Close()
 		cancel()
-		return nil, err
+		return nil, fmt.Errorf("dht init: %w", err)
 	}
 	node.dht = kad
-
+	go func() {
+		time.Sleep(time.Second * 2)
+		if err := kad.Bootstrap(node.ctx); err != nil {
+			// Просто логируем для инфо, НЕ закрываем узел
+			fmt.Printf("DHT Bootstrap info: %v\n", err)
+		}
+	}()
 	for _, info := range dht.GetDefaultBootstrapPeerAddrInfos() {
 		node.rememberPeer(info)
 		h.Peerstore().AddAddrs(info.ID, info.Addrs, peerstore.PermanentAddrTTL)
@@ -129,10 +138,6 @@ func NewNode(parent context.Context, identity *corecrypto.Identity, packetHandle
 			_ = h.Connect(ctx, info)
 		}(info)
 	}
-	if err := kad.Bootstrap(ctx); err != nil {
-		node.Close()
-		return nil, err
-	}
 
 	service := mdns.NewMdnsService(h, mdnsServiceName, node)
 	if err := service.Start(); err != nil {
@@ -141,10 +146,9 @@ func NewNode(parent context.Context, identity *corecrypto.Identity, packetHandle
 	}
 	node.mdns = service
 
-	if err := node.PublishSelf(); err != nil {
-		node.Close()
-		return nil, err
-	}
+	// DHT table is likely empty at startup before LAN peers are discovered.
+	// We ignore the error here; refreshLoop will retry publishing later.
+	_ = node.PublishSelf()
 
 	node.wg.Add(1)
 	go node.refreshLoop()

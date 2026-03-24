@@ -504,13 +504,14 @@ export default function App() {
   async function openManualContactPopover() {
     setContactForm(buildEmptyContact());
     setInvitePeerIdDraft("");
+    setInviteCode(null);
+    setShowNewContactPopover(true);
     try {
       const invite = await loadInviteCode();
       setInviteCode(invite);
     } catch {
-      setInviteCode(null);
+      setInviteCode({ code: "Unavailable", peer_id: "", expires_at: 0 });
     }
-    setShowNewContactPopover(true);
   }
 
   function prefillFromCurrentPeer() {
@@ -542,32 +543,40 @@ export default function App() {
       <div className="app-shell">
       <aside className="rail rail-left">
         <section className="profile-strip">
-        <div className="emoji-anchor">
-  <button
-    type="button"
-    className="avatar-badge avatar-button"
-    onClick={() => setEmojiPickerTarget((current) => (current === "self" ? null : "self"))}
-  >
-    {selfEmoji}
-  </button>
-  {emojiPickerTarget === "self" ? (
-    <div className="emoji-popover emoji-popover-left scrollable-emoji">
-      {EMOJI_OPTIONS.map((emoji) => (
-        <button 
-          key={emoji} 
-          type="button" 
-          className="emoji-option" 
-          onClick={() => updateSelfEmoji(emoji)}
-        >
-          {emoji}
-        </button>
-      ))}
-    </div>
-  ) : null}
-</div>
+          <div className="emoji-anchor">
+            <button
+              type="button"
+              className="avatar-badge avatar-button"
+              onClick={() => setEmojiPickerTarget((current) => (current === "self" ? null : "self"))}
+            >
+              {selfEmoji}
+            </button>
+            {emojiPickerTarget === "self" ? (
+              <div className="emoji-popover emoji-popover-left scrollable-emoji">
+                {EMOJI_OPTIONS.map((emoji) => (
+                  <button 
+                    key={emoji} 
+                    type="button" 
+                    className="emoji-option" 
+                    onClick={() => updateSelfEmoji(emoji)}
+                  >
+                    {emoji}
+                  </button>
+                ))}
+              </div>
+            ) : null}
+          </div>
           <div className="profile-copy-block">
-            <p className="eyebrow">You</p>
-            <h2>{snapshot.local_id}</h2>
+            <p 
+              className="eyebrow"
+              title="Click to copy your Peer ID"
+              style={{ cursor: "pointer", display: "inline-block", marginBottom: "4px" }}
+              onClick={() => {
+                if (snapshot.local_id) navigator.clipboard.writeText(snapshot.local_id);
+              }}
+            >
+              You
+            </p>
             <p>{snapshot.chats.length} chats · {snapshot.neighbors.length} nearby peers</p>
           </div>
         </section>

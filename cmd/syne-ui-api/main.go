@@ -29,7 +29,7 @@ func main() {
 		port    int
 		workdir string
 	)
-	flag.StringVar(&addr, "addr", "127.0.0.1:38673", "HTTP listen address")
+	flag.StringVar(&addr, "addr", "0.0.0.0:38673", "HTTP listen address")
 	flag.StringVar(&localID, "id", "", "Local peer ID")
 	flag.IntVar(&port, "port", 3000, "Preferred local TCP port")
 	flag.StringVar(&workdir, "workdir", "", "Working directory for local data files")
@@ -90,6 +90,7 @@ func main() {
 	}()
 
 	log.Printf("syne ui api listening on http://%s", addr)
+	fmt.Println("!!! API SERVER STARTED ON 0.0.0.0:38673 !!!")
 	if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("http server: %v", err)
 	}

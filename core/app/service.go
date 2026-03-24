@@ -482,9 +482,14 @@ func (s *Service) GetInviteCode() (InviteCode, error) {
 }
 
 func (s *Service) ResolveInviteCode(code string) (string, error) {
-	ctx, cancel := context.WithTimeout(s.ctx, 8*time.Second)
+	ctx, cancel := context.WithTimeout(s.ctx, 20*time.Second)
 	defer cancel()
-	return s.node.ResolveInvite(ctx, code)
+
+	peerID, err := s.node.ResolveInvite(ctx, code)
+	if err != nil {
+		return "", fmt.Errorf("код не найден или сеть недоступна: %w", err)
+	}
+	return peerID, nil
 }
 
 func (s *Service) routeMessage(msg protocol.Message) (protocol.Strategy, error) {
@@ -863,19 +868,16 @@ func (s *Service) bootstrapContactHints() error {
 }
 
 func bestAddr(info peer.AddrInfo) string {
+	if len(info.Addrs) == 0 {
+		return ""
+	}
 	for _, addr := range info.Addrs {
-		text := addr.String()
-		if strings.Contains(text, "/p2p-circuit") {
-			continue
+		if !strings.Contains(addr.String(), "/p2p-circuit") {
+			return addr.String()
 		}
-		return text
 	}
-	if len(info.Addrs) > 0 {
-		return info.Addrs[0].String()
-	}
-	return ""
+	return info.Addrs[0].String()
 }
-
 func privateChatID(a, b string) string {
 	if a <= b {
 		return "dm:" + a + ":" + b
