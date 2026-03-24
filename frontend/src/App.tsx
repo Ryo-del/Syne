@@ -62,12 +62,18 @@ function splitAddress(addr?: string) {
   if (!addr) {
     return { ip: "", port: "" };
   }
+  if (addr.startsWith("/")) {
+    const parts = addr.split("/");
+    if (parts.length >= 5 && (parts[1] === "ip4" || parts[1] === "ip6")) {
+      return { ip: parts[2], port: parts[4] };
+    }
+  }
   const index = addr.lastIndexOf(":");
   if (index === -1) {
-    return { ip: addr, port: "" };
+    return { ip: addr.replace(/^\[|\]$/g, ""), port: "" };
   }
   return {
-    ip: addr.slice(0, index),
+    ip: addr.slice(0, index).replace(/^\[|\]$/g, ""),
     port: addr.slice(index + 1),
   };
 }
@@ -350,7 +356,8 @@ export default function App() {
   async function handleOpenPeer(peerId: string, peerAddr?: string, name?: string) {
     try {
       setError("");
-      const chat = await openPrivateChat({ peer_id: peerId, peer_addr: peerAddr, name });
+      const resolvedName = (name && name !== peerId) ? name : `Anonymous ${peerId.slice(-4)}`;
+      const chat = await openPrivateChat({ peer_id: peerId, peer_addr: peerAddr, name: resolvedName });
       startTransition(() => {
         setSnapshot((current) => ({
           ...current,

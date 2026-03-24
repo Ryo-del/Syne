@@ -448,9 +448,18 @@ func (n *Node) rememberPeer(info peer.AddrInfo) {
 	n.knownPeers[info.ID] = info
 	n.mu.Unlock()
 
-	if n.peerHandler != nil && info.ID != n.host.ID() {
+	if n.peerHandler != nil && info.ID != n.host.ID() && !isBootstrapNode(info.ID) {
 		n.peerHandler(info)
 	}
+}
+
+func isBootstrapNode(id peer.ID) bool {
+	for _, info := range dht.GetDefaultBootstrapPeerAddrInfos() {
+		if info.ID == id {
+			return true
+		}
+	}
+	return false
 }
 
 func (n *Node) refreshLoop() {

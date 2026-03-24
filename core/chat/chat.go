@@ -23,7 +23,8 @@ type UserData struct {
 }
 
 func (c Contact) Address() string {
-	return net.JoinHostPort(c.IP, c.Port)
+	ip := strings.Trim(c.IP, "[]")
+	return net.JoinHostPort(ip, c.Port)
 }
 
 func DeleteContact(query string) error {
@@ -145,7 +146,7 @@ func RenameContact(query, newName string) error {
 func AddContact(c Contact) error {
 	c.Name = strings.TrimSpace(c.Name)
 	c.PeerID = strings.TrimSpace(c.PeerID)
-	c.IP = strings.TrimSpace(c.IP)
+	c.IP = strings.Trim(strings.TrimSpace(c.IP), "[]")
 	c.Port = strings.TrimSpace(c.Port)
 	if c.Name == "" || c.PeerID == "" || c.IP == "" || c.Port == "" {
 		return fmt.Errorf("name, peer_id, ip and port are required")
