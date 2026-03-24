@@ -66,6 +66,8 @@ func main() {
 	mux.HandleFunc("/api/chats/read", srv.handleReadChat)
 	mux.HandleFunc("/api/chats/", srv.handleChatRoutes)
 	mux.HandleFunc("/api/messages", srv.handleSendMessage)
+	mux.HandleFunc("/api/invite", srv.handleInvite)
+	mux.HandleFunc("/api/invite/resolve", srv.handleResolveInvite)
 	mux.HandleFunc("/api/contacts", srv.handleContacts)
 	mux.HandleFunc("/api/contacts/", srv.handleContactRoutes)
 	mux.HandleFunc("/api/blocked", srv.handleBlocked)
@@ -287,6 +289,41 @@ func (s *server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, message)
+}
+
+func (s *server) handleInvite(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	invite, err := s.service.GetInviteCode()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, invite)
+}
+
+func (s *server) handleResolveInvite(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var req struct {
+		Code string `json:"code"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	peerID, err := s.service.ResolveInviteCode(req.Code)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{
+		"peer_id": peerID,
+	})
 }
 
 func (s *server) handleContacts(w http.ResponseWriter, r *http.Request) {

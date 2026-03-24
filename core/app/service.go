@@ -2,25 +2,27 @@ package app
 
 import (
 	corechat "Syne/core/chat"
-	"Syne/core/crypto"
-	"Syne/core/discovery"
+	corecrypto "Syne/core/crypto"
 	"Syne/core/history"
 	"Syne/core/protocol"
-	"Syne/core/transport"
+	p2ptransport "Syne/core/transport/p2p"
 	"context"
-	"crypto/ecdh"
 	"errors"
 	"fmt"
-	"net"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
+	"github.com/libp2p/go-libp2p/core/peer"
 )
 
-const defaultHopTTL = 4
+const (
+	defaultHopTTL        = 4
+	dedupCapacity        = 1000
+	defaultInviteTTL     = 15 * time.Minute
+	relayFallbackTimeout = 2 * time.Second
+)
 
 type Config struct {
 	LocalID string `json:"local_id"`
@@ -64,6 +66,7 @@ type UIMessage struct {
 	Text      string `json:"text"`
 	Timestamp int64  `json:"timestamp"`
 	Direction string `json:"direction"`
+	Strategy  string `json:"strategy"`
 }
 
 type Event struct {
@@ -77,6 +80,12 @@ type Event struct {
 	Error     string                `json:"error,omitempty"`
 }
 
+type InviteCode struct {
+	Code      string `json:"code"`
+	PeerID    string `json:"peer_id"`
+	ExpiresAt int64  `json:"expires_at"`
+}
+
 type rateState struct {
 	tokens float64
 	last   time.Time
@@ -85,21 +94,17 @@ type rateState struct {
 type Service struct {
 	cfg Config
 
-	ctx    context.Context
-	cancel context.CancelFunc
+	ctx      context.Context
+	cancel   context.CancelFunc
+	identity *corecrypto.Identity
+	node     *p2ptransport.Node
 
-	listener *net.TCPListener
-
-	identityPriv *ecdh.PrivateKey
-	identityPub  []byte
-
-	stateMu          sync.RWMutex
-	neighbors        map[string]PeerPresence
-	peerPubs         map[string]*ecdh.PublicKey
-	seen             map[string]time.Time
-	unread           map[string]int
-	rateStates       map[string]*rateState
-	discoveryStarted bool
+	stateMu    sync.RWMutex
+	neighbors  map[string]PeerPresence
+	seen       map[string]time.Time
+	seenOrder  []string
+	unread     map[string]int
+	rateStates map[string]*rateState
 
 	subMu       sync.RWMutex
 	subscribers map[chan Event]struct{}
@@ -108,81 +113,51 @@ type Service struct {
 }
 
 func New(config Config) (*Service, error) {
-	profile, err := corechat.GetUserData()
+	identity, err := corecrypto.LoadOrCreateIdentity()
 	if err != nil {
 		return nil, err
 	}
-
-	localID := strings.TrimSpace(config.LocalID)
-
-	if localID == "" {
-		localID = strings.TrimSpace(profile.ID)
-	}
-
-	if localID != "" {
-		if err := corechat.SaveUserProfile(corechat.UserData{
-			ID: localID,
-		}); err != nil {
-			return nil, err
-		}
-	}
-
-	port := config.Port
-	if port <= 0 {
-		port = 3000
-	}
-	for !transport.IsPortFree(port) {
-		port++
-	}
-
-	identityPriv, err := crypto.LoadOrCreateIdentityKey()
-	if err != nil {
-		return nil, err
-	}
-	identityPub, err := crypto.PublicKeyBytes(identityPriv)
-	if err != nil {
-		return nil, err
-	}
-
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Service{
 		cfg: Config{
-			LocalID: localID,
-			Port:    port,
+			LocalID: identity.PeerID,
+			Port:    config.Port,
 		},
-		ctx:          ctx,
-		cancel:       cancel,
-		identityPriv: identityPriv,
-		identityPub:  identityPub,
-		neighbors:    make(map[string]PeerPresence),
-		peerPubs:     make(map[string]*ecdh.PublicKey),
-		seen:         make(map[string]time.Time),
-		unread:       make(map[string]int),
-		rateStates:   make(map[string]*rateState),
-		subscribers:  make(map[chan Event]struct{}),
+		ctx:         ctx,
+		cancel:      cancel,
+		identity:    identity,
+		neighbors:   make(map[string]PeerPresence),
+		seen:        make(map[string]time.Time),
+		unread:      make(map[string]int),
+		rateStates:  make(map[string]*rateState),
+		subscribers: make(map[chan Event]struct{}),
 	}, nil
 }
 
 func (s *Service) Start() error {
-	listener, err := transport.ListenTCP(s.cfg.Port)
+	if err := history.UpsertPeerAlias(s.cfg.LocalID, "You"); err != nil {
+		return err
+	}
+	if err := history.TouchChat(history.ChatRecord{}); err != nil {
+		return err
+	}
+	node, err := p2ptransport.NewNode(s.ctx, s.identity, s.handlePacket, s.handlePeer)
 	if err != nil {
 		return err
 	}
-	s.listener = listener
-
-	if err := s.startDiscoveryIfNeeded(); err != nil {
-		_ = listener.Close()
+	s.node = node
+	if err := s.bootstrapContactHints(); err != nil {
 		return err
 	}
 	s.wg.Add(1)
-	go s.acceptLoop()
+	go s.retryOutboxLoop()
 	return nil
 }
 
 func (s *Service) Stop() {
 	s.cancel()
-	if s.listener != nil {
-		_ = s.listener.Close()
+	if s.node != nil {
+		_ = s.node.Close()
 	}
 	s.wg.Wait()
 
@@ -237,11 +212,9 @@ func (s *Service) Subscribe(buffer int) (<-chan Event, func()) {
 		buffer = 32
 	}
 	ch := make(chan Event, buffer)
-
 	s.subMu.Lock()
 	s.subscribers[ch] = struct{}{}
 	s.subMu.Unlock()
-
 	return ch, func() {
 		s.subMu.Lock()
 		if _, ok := s.subscribers[ch]; ok {
@@ -257,7 +230,6 @@ func (s *Service) ListMessages(chatID string) ([]UIMessage, error) {
 	if err != nil {
 		return nil, err
 	}
-
 	messages := make([]UIMessage, 0, len(items))
 	for _, item := range items {
 		direction := "incoming"
@@ -272,21 +244,13 @@ func (s *Service) ListMessages(chatID string) ([]UIMessage, error) {
 			Text:      string(item.Payload),
 			Timestamp: item.Timestamp,
 			Direction: direction,
+			Strategy:  item.Strategy.String(),
 		})
 	}
-	sort.Slice(messages, func(i, j int) bool {
-		if messages[i].Timestamp == messages[j].Timestamp {
-			return messages[i].MessageID < messages[j].MessageID
-		}
-		return messages[i].Timestamp < messages[j].Timestamp
-	})
 	return messages, nil
 }
 
 func (s *Service) OpenPrivateChat(peerID, peerAddr, name string) (ChatSummary, error) {
-	if strings.TrimSpace(s.cfg.LocalID) == "" {
-		return ChatSummary{}, fmt.Errorf("peer_id is not configured yet")
-	}
 	peerID = strings.TrimSpace(peerID)
 	peerAddr = strings.TrimSpace(peerAddr)
 	name = strings.TrimSpace(name)
@@ -298,13 +262,14 @@ func (s *Service) OpenPrivateChat(peerID, peerAddr, name string) (ChatSummary, e
 	} else if blocked {
 		return ChatSummary{}, fmt.Errorf("peer is blocked: %s", peerID)
 	}
-
+	if peerAddr != "" && s.node != nil {
+		_ = s.node.RememberHint(peerID, peerAddr)
+	}
 	chatID := privateChatID(s.cfg.LocalID, peerID)
 	title := name
 	if title == "" {
 		title = s.lookupPeerTitle(peerID)
 	}
-
 	if err := history.TouchChat(history.ChatRecord{
 		ChatID: chatID,
 		PeerID: peerID,
@@ -312,25 +277,6 @@ func (s *Service) OpenPrivateChat(peerID, peerAddr, name string) (ChatSummary, e
 	}); err != nil {
 		return ChatSummary{}, err
 	}
-
-	if peerAddr != "" {
-		if err := s.sendJoin(peerID, peerAddr, chatID); err != nil {
-			s.emit(Event{
-				Type:      "error",
-				Timestamp: time.Now().UnixMilli(),
-				Error:     err.Error(),
-			})
-		}
-	} else if peer := s.resolvePeer(peerID, ""); peer != nil {
-		if err := s.sendJoin(peerID, peer.Addr.String(), chatID); err != nil {
-			s.emit(Event{
-				Type:      "error",
-				Timestamp: time.Now().UnixMilli(),
-				Error:     err.Error(),
-			})
-		}
-	}
-
 	summary, err := s.chatSummaryByID(chatID)
 	if err != nil {
 		return ChatSummary{}, err
@@ -339,9 +285,6 @@ func (s *Service) OpenPrivateChat(peerID, peerAddr, name string) (ChatSummary, e
 }
 
 func (s *Service) SendMessage(chatID, targetID, text string) (UIMessage, error) {
-	if strings.TrimSpace(s.cfg.LocalID) == "" {
-		return UIMessage{}, fmt.Errorf("peer_id is not configured yet")
-	}
 	chatID = strings.TrimSpace(chatID)
 	targetID = strings.TrimSpace(targetID)
 	text = strings.TrimSpace(text)
@@ -358,14 +301,24 @@ func (s *Service) SendMessage(chatID, targetID, text string) (UIMessage, error) 
 		Version:   protocol.ProtocolVersion,
 		Type:      protocol.MsgChat,
 		Target:    protocol.TargetPeer,
-		MessageID: uuid.NewString(),
-		HopTTL:    defaultHopTTL,
+		Strategy:  protocol.StrategyUnknown,
+		TTL:       defaultHopTTL,
 		TargetID:  targetID,
 		ChatID:    chatID,
 		From:      s.cfg.LocalID,
 		Payload:   []byte(text),
 		Timestamp: time.Now().UnixMilli(),
 	}
+	if err := msg.Sign(s.identity.PrivateKey); err != nil {
+		return UIMessage{}, err
+	}
+
+	strategy, err := s.routeMessage(msg)
+	if err != nil {
+		return UIMessage{}, err
+	}
+	msg.Strategy = strategy
+
 	if err := history.SaveMessage(msg); err != nil {
 		return UIMessage{}, err
 	}
@@ -379,39 +332,15 @@ func (s *Service) SendMessage(chatID, targetID, text string) (UIMessage, error) 
 		return UIMessage{}, err
 	}
 
-	sendMsg := msg
-	peer := s.resolvePeer(targetID, "")
-	if peer != nil {
-		s.stateMu.RLock()
-		remotePub := s.peerPubs[targetID]
-		s.stateMu.RUnlock()
-		if remotePub != nil {
-			key, err := crypto.DeriveChatKey(s.identityPriv, remotePub, chatID)
-			if err != nil {
-				return UIMessage{}, err
-			}
-			ciphertext, nonce, err := crypto.EncryptPayload(key, sendMsg.Payload)
-			if err != nil {
-				return UIMessage{}, err
-			}
-			sendMsg.Payload = ciphertext
-			sendMsg.Nonce = nonce
-		}
-		if err := s.sendProtocolMessage(peer, sendMsg); err != nil {
-			return UIMessage{}, err
-		}
-	} else if err := s.forwardToNeighbors(sendMsg, nil); err != nil {
-		return UIMessage{}, err
-	}
-
 	ui := UIMessage{
-		MessageID: msg.MessageID,
+		MessageID: msg.ID,
 		ChatID:    msg.ChatID,
 		TargetID:  msg.TargetID,
 		From:      msg.From,
 		Text:      text,
 		Timestamp: msg.Timestamp,
 		Direction: "outgoing",
+		Strategy:  strategy.String(),
 	}
 	summary, _ := s.chatSummaryByID(chatID)
 	s.emit(Event{
@@ -431,7 +360,6 @@ func (s *Service) MarkChatRead(chatID string) error {
 	s.stateMu.Lock()
 	delete(s.unread, chatID)
 	s.stateMu.Unlock()
-
 	summary, err := s.chatSummaryByID(chatID)
 	if err != nil {
 		return err
@@ -452,6 +380,12 @@ func (s *Service) AddContact(contact corechat.Contact) (corechat.Contact, error)
 	if err != nil {
 		return corechat.Contact{}, err
 	}
+	if err := history.UpsertPeerAlias(created.PeerID, created.Name); err != nil {
+		return corechat.Contact{}, err
+	}
+	if s.node != nil {
+		_ = s.node.RememberHint(created.PeerID, created.Address())
+	}
 	chatID := privateChatID(s.cfg.LocalID, created.PeerID)
 	if err := history.TouchChat(history.ChatRecord{
 		ChatID: chatID,
@@ -460,19 +394,11 @@ func (s *Service) AddContact(contact corechat.Contact) (corechat.Contact, error)
 	}); err != nil {
 		return corechat.Contact{}, err
 	}
-
 	s.emit(Event{
 		Type:      "contact_added",
 		Timestamp: time.Now().UnixMilli(),
 		Contact:   &created,
 	})
-	if summary, err := s.chatSummaryByID(chatID); err == nil {
-		s.emit(Event{
-			Type:      "chat_updated",
-			Timestamp: time.Now().UnixMilli(),
-			Chat:      &summary,
-		})
-	}
 	return created, nil
 }
 
@@ -482,6 +408,9 @@ func (s *Service) RenameContact(query, newName string) (corechat.Contact, error)
 	}
 	updated, err := corechat.FindContact(newName)
 	if err != nil {
+		return corechat.Contact{}, err
+	}
+	if err := history.UpsertPeerAlias(updated.PeerID, updated.Name); err != nil {
 		return corechat.Contact{}, err
 	}
 	s.emit(Event{
@@ -536,104 +465,81 @@ func (s *Service) UnblockPeer(query string) error {
 }
 
 func (s *Service) UpdateLocalPeerID(peerID string) error {
-	peerID = strings.TrimSpace(peerID)
-	if err := validatePeerID(peerID); err != nil {
-		return err
-	}
-
-	s.stateMu.Lock()
-	if strings.TrimSpace(s.cfg.LocalID) != "" {
-		s.stateMu.Unlock()
-		return fmt.Errorf("peer_id is already set")
-	}
-	s.cfg.LocalID = peerID
-	s.stateMu.Unlock()
-
-	if err := corechat.SaveUserProfile(corechat.UserData{
-		ID: peerID,
-	}); err != nil {
-		s.stateMu.Lock()
-		s.cfg.LocalID = ""
-		s.stateMu.Unlock()
-		return err
-	}
-
-	return s.startDiscoveryIfNeeded()
+	return fmt.Errorf("peer_id is derived from .identity and cannot be changed from UI")
 }
 
-func (s *Service) acceptLoop() {
-	defer s.wg.Done()
-	for {
-		conn, sender, err := transport.AcceptTCP(s.listener)
-		if err != nil {
-			if errors.Is(err, net.ErrClosed) || s.ctx.Err() != nil {
-				return
-			}
-			s.emit(Event{
-				Type:      "error",
-				Timestamp: time.Now().UnixMilli(),
-				Error:     err.Error(),
-			})
-			continue
+func (s *Service) GetInviteCode() (InviteCode, error) {
+	code := fmt.Sprintf("%06d", time.Now().UnixNano()%1000000)
+	rec, err := s.node.PublishInvite(code, defaultInviteTTL)
+	if err != nil {
+		return InviteCode{}, err
+	}
+	return InviteCode{
+		Code:      code,
+		PeerID:    rec.PeerID,
+		ExpiresAt: rec.ExpiresAt,
+	}, nil
+}
+
+func (s *Service) ResolveInviteCode(code string) (string, error) {
+	ctx, cancel := context.WithTimeout(s.ctx, 8*time.Second)
+	defer cancel()
+	return s.node.ResolveInvite(ctx, code)
+}
+
+func (s *Service) routeMessage(msg protocol.Message) (protocol.Strategy, error) {
+	type result struct {
+		strategy protocol.Strategy
+		err      error
+	}
+
+	hopCh := make(chan result, 1)
+	go func() {
+		hopCtx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
+		defer cancel()
+		hopCh <- result{strategy: protocol.StrategyHop, err: s.node.SendHop(hopCtx, msg, "")}
+	}()
+
+	directCtx, cancel := context.WithTimeout(s.ctx, relayFallbackTimeout)
+	defer cancel()
+	if strategy, err := s.node.SendDirect(directCtx, msg, false); err == nil {
+		return strategy, nil
+	}
+
+	if strategy, err := s.node.SendDirect(s.ctx, msg, true); err == nil {
+		return strategy, nil
+	}
+
+	select {
+	case hopResult := <-hopCh:
+		if hopResult.err == nil {
+			return hopResult.strategy, nil
 		}
-
-		s.wg.Add(1)
-		go func(conn net.Conn, sender *net.TCPAddr) {
-			defer s.wg.Done()
-			_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-			data, err := transport.ReceiveTCP(conn, 64*1024)
-			if err != nil {
-				s.emit(Event{
-					Type:      "error",
-					Timestamp: time.Now().UnixMilli(),
-					Error:     fmt.Sprintf("receive error from %s: %v", sender, err),
-				})
-				return
-			}
-
-			msg, err := protocol.UnmarshalMessage(data)
-			if err != nil {
-				s.emit(Event{
-					Type:      "error",
-					Timestamp: time.Now().UnixMilli(),
-					Error:     fmt.Sprintf("decode error from %s: %v", sender, err),
-				})
-				return
-			}
-			if err := protocol.ValidateMessage(msg); err != nil {
-				s.emit(Event{
-					Type:      "error",
-					Timestamp: time.Now().UnixMilli(),
-					Error:     fmt.Sprintf("invalid message from %s: %v", sender, err),
-				})
-				return
-			}
-			s.handleIncoming(msg, sender)
-		}(conn, sender)
+	default:
 	}
+
+	msg.Strategy = protocol.StrategyOffline
+	if err := history.QueueMessage(msg, time.Now().Add(10*time.Second).UnixMilli()); err != nil {
+		return protocol.StrategyUnknown, err
+	}
+	return protocol.StrategyOffline, nil
 }
 
-func (s *Service) handleIncoming(msg protocol.Message, sender *net.TCPAddr) {
+func (s *Service) handlePacket(msg protocol.Message, sender peer.AddrInfo) {
 	now := time.Now()
+	if blocked, err := corechat.IsBlocked(msg.From); err != nil {
+		s.emitError(err)
+		return
+	} else if blocked {
+		return
+	}
+	if !s.allowRate(sender.ID.String(), now, 20, 40) {
+		return
+	}
+	s.registerNeighbor(msg.From, bestAddr(sender), msg.From)
+
 	switch msg.Type {
-	case protocol.MsgJoin:
-		if blocked, err := corechat.IsBlocked(msg.From); err != nil {
-			s.emitError(err)
-			return
-		} else if blocked {
-			return
-		}
-		if !s.allowRate(senderKey(sender), now, 8, 16) {
-			return
-		}
-		s.registerNeighbor(msg.From, sender.String())
-		s.rememberPeerPub(msg.From, msg.FromPub)
-
-		ack := protocol.NewJoinAck(msg.ChatID, s.cfg.LocalID, msg.From)
-		ack.FromPub = s.identityPub
-		if err := s.sendAck(ack, sender); err != nil {
-			s.emitError(err)
-		}
+	case protocol.MsgJoin, protocol.MsgJoinAck:
 		if summary, err := s.chatSummaryByID(msg.ChatID); err == nil {
 			s.emit(Event{
 				Type:      "chat_updated",
@@ -641,102 +547,47 @@ func (s *Service) handleIncoming(msg protocol.Message, sender *net.TCPAddr) {
 				Chat:      &summary,
 			})
 		}
-	case protocol.MsgJoinAck:
-		if blocked, err := corechat.IsBlocked(msg.From); err != nil {
-			s.emitError(err)
-			return
-		} else if blocked {
-			return
-		}
-		s.registerNeighbor(msg.From, sender.String())
-		s.rememberPeerPub(msg.From, msg.FromPub)
-		if summary, err := s.chatSummaryByID(msg.ChatID); err == nil {
-			s.emit(Event{
-				Type:      "chat_updated",
-				Timestamp: now.UnixMilli(),
-				Chat:      &summary,
-			})
-		}
-
 	case protocol.MsgChat:
-		if msg.MessageID == "" {
+		if s.isSeen(msg.ID, now, 10*time.Minute) {
 			return
 		}
-		if blocked, err := corechat.IsBlocked(msg.From); err != nil {
-			s.emitError(err)
-			return
-		} else if blocked {
-			return
-		}
-		if !s.allowRate(senderKey(sender), now, 20, 40) {
-			return
-		}
-		if s.isSeen(msg.MessageID, now, 10*time.Minute) {
-			return
-		}
-		s.registerNeighbor(msg.From, sender.String())
-
 		if msg.TargetID != s.cfg.LocalID {
-			if msg.HopTTL <= 1 {
+			if msg.Strategy != protocol.StrategyHop || msg.TTL <= 1 {
 				return
 			}
-			msg.HopTTL--
-			_ = s.forwardToNeighbors(msg, sender)
+			msg.TTL--
+			_ = s.node.SendHop(s.ctx, msg, sender.ID.String())
 			return
 		}
-
-		payload := msg.Payload
-		if len(msg.Nonce) > 0 {
-			s.stateMu.RLock()
-			remotePub := s.peerPubs[msg.From]
-			s.stateMu.RUnlock()
-			if remotePub == nil {
-				return
-			}
-			key, err := crypto.DeriveChatKey(s.identityPriv, remotePub, msg.ChatID)
-			if err != nil {
-				s.emitError(err)
-				return
-			}
-			plain, err := crypto.DecryptPayload(key, msg.Nonce, msg.Payload)
-			if err != nil {
-				s.emitError(err)
-				return
-			}
-			payload = plain
-		}
-
-		plainMsg := msg
-		plainMsg.Payload = payload
-		plainMsg.Nonce = nil
-		if err := history.SaveMessage(plainMsg); err != nil {
+		if err := history.SaveMessage(msg); err != nil {
 			s.emitError(err)
 			return
 		}
 		if err := history.TouchChat(history.ChatRecord{
-			ChatID:        plainMsg.ChatID,
-			PeerID:        plainMsg.From,
-			Title:         s.lookupPeerTitle(plainMsg.From),
-			LastMessage:   string(payload),
-			LastTimestamp: plainMsg.Timestamp,
+			ChatID:        msg.ChatID,
+			PeerID:        msg.From,
+			Title:         s.lookupPeerTitle(msg.From),
+			LastMessage:   string(msg.Payload),
+			LastTimestamp: msg.Timestamp,
 		}); err != nil {
 			s.emitError(err)
 		}
 
 		s.stateMu.Lock()
-		s.unread[plainMsg.ChatID]++
+		s.unread[msg.ChatID]++
 		s.stateMu.Unlock()
 
 		ui := UIMessage{
-			MessageID: plainMsg.MessageID,
-			ChatID:    plainMsg.ChatID,
-			TargetID:  plainMsg.TargetID,
-			From:      plainMsg.From,
-			Text:      string(payload),
-			Timestamp: plainMsg.Timestamp,
+			MessageID: msg.ID,
+			ChatID:    msg.ChatID,
+			TargetID:  msg.TargetID,
+			From:      msg.From,
+			Text:      string(msg.Payload),
+			Timestamp: msg.Timestamp,
 			Direction: "incoming",
+			Strategy:  msg.Strategy.String(),
 		}
-		summary, _ := s.chatSummaryByID(plainMsg.ChatID)
+		summary, _ := s.chatSummaryByID(msg.ChatID)
 		s.emit(Event{
 			Type:      "message_received",
 			Timestamp: now.UnixMilli(),
@@ -746,14 +597,20 @@ func (s *Service) handleIncoming(msg protocol.Message, sender *net.TCPAddr) {
 	}
 }
 
-func (s *Service) registerNeighbor(peerID, addr string) {
+func (s *Service) handlePeer(info peer.AddrInfo) {
+	if info.ID.String() == s.cfg.LocalID {
+		return
+	}
+	s.registerNeighbor(info.ID.String(), bestAddr(info), info.ID.String())
+}
+
+func (s *Service) registerNeighbor(peerID, addr, name string) {
 	peerID = strings.TrimSpace(peerID)
 	addr = strings.TrimSpace(addr)
-	if peerID == "" || peerID == s.cfg.LocalID || addr == "" {
+	if peerID == "" || peerID == s.cfg.LocalID {
 		return
 	}
 	blocked, _ := corechat.IsBlocked(peerID)
-
 	item := PeerPresence{
 		PeerID:   peerID,
 		Name:     s.lookupPeerTitle(peerID),
@@ -761,11 +618,9 @@ func (s *Service) registerNeighbor(peerID, addr string) {
 		LastSeen: time.Now().UnixMilli(),
 		Blocked:  blocked,
 	}
-
 	s.stateMu.Lock()
 	s.neighbors[peerID] = item
 	s.stateMu.Unlock()
-
 	s.emit(Event{
 		Type:      "peer_discovered",
 		Timestamp: item.LastSeen,
@@ -774,6 +629,9 @@ func (s *Service) registerNeighbor(peerID, addr string) {
 }
 
 func (s *Service) lookupPeerName(peerID string) string {
+	if name, err := history.LookupPeerAlias(peerID); err == nil && name != "" {
+		return name
+	}
 	contacts, err := corechat.ListContacts()
 	if err != nil {
 		return ""
@@ -815,9 +673,11 @@ func (s *Service) listChats() ([]ChatSummary, error) {
 	for _, item := range blocked {
 		blockedSet[item.PeerID] = struct{}{}
 	}
-	chats := make([]ChatSummary, 0, len(records))
+
 	s.stateMu.RLock()
 	defer s.stateMu.RUnlock()
+
+	chats := make([]ChatSummary, 0, len(records))
 	for _, record := range records {
 		addr := ""
 		if item, ok := contactMap[record.PeerID]; ok {
@@ -826,15 +686,14 @@ func (s *Service) listChats() ([]ChatSummary, error) {
 			addr = neighbor.Addr
 		}
 		title := strings.TrimSpace(record.Title)
-		if item, ok := contactMap[record.PeerID]; ok && item.Name != "" {
-			title = item.Name
+		if alias := s.lookupPeerName(record.PeerID); alias != "" {
+			title = alias
 		}
 		if title == "" {
 			title = record.PeerID
 		}
 		_, isBlocked := blockedSet[record.PeerID]
 		_, online := s.neighbors[record.PeerID]
-
 		chats = append(chats, ChatSummary{
 			ChatID:        record.ChatID,
 			PeerID:        record.PeerID,
@@ -891,44 +750,6 @@ func (s *Service) emitError(err error) {
 	})
 }
 
-func (s *Service) startDiscoveryIfNeeded() error {
-	s.stateMu.Lock()
-	if s.discoveryStarted || strings.TrimSpace(s.cfg.LocalID) == "" {
-		s.stateMu.Unlock()
-		return nil
-	}
-	localID := s.cfg.LocalID
-	port := s.cfg.Port
-	s.discoveryStarted = true
-	s.stateMu.Unlock()
-
-	if err := discovery.StartLANDiscovery(
-		s.ctx,
-		localID,
-		port,
-		s.registerNeighbor,
-	); err != nil {
-		s.stateMu.Lock()
-		s.discoveryStarted = false
-		s.stateMu.Unlock()
-		return err
-	}
-	return nil
-}
-
-func (s *Service) rememberPeerPub(peerID string, raw []byte) {
-	if len(raw) != crypto.X25519PublicKeySize {
-		return
-	}
-	pub, err := crypto.ParseX25519PublicKey(raw)
-	if err != nil {
-		return
-	}
-	s.stateMu.Lock()
-	s.peerPubs[peerID] = pub
-	s.stateMu.Unlock()
-}
-
 func (s *Service) allowRate(key string, now time.Time, ratePerSec, burst float64) bool {
 	if key == "" {
 		key = "unknown"
@@ -963,6 +784,12 @@ func (s *Service) isSeen(id string, now time.Time, ttl time.Duration) bool {
 		return true
 	}
 	s.seen[id] = now
+	s.seenOrder = append(s.seenOrder, id)
+	for len(s.seenOrder) > dedupCapacity {
+		oldest := s.seenOrder[0]
+		s.seenOrder = s.seenOrder[1:]
+		delete(s.seen, oldest)
+	}
 	for key, ts := range s.seen {
 		if now.Sub(ts) > ttl {
 			delete(s.seen, key)
@@ -971,107 +798,82 @@ func (s *Service) isSeen(id string, now time.Time, ttl time.Duration) bool {
 	return false
 }
 
-func (s *Service) resolvePeer(peerID, addrHint string) *transport.Peer {
-	addrHint = strings.TrimSpace(addrHint)
-	if addrHint != "" {
-		addr, err := net.ResolveTCPAddr("tcp", addrHint)
-		if err == nil {
-			return &transport.Peer{PeerID: peerID, Addr: addr}
+func (s *Service) retryOutboxLoop() {
+	defer s.wg.Done()
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-ticker.C:
+			s.retryDueOutbox()
 		}
 	}
-
-	if contact, err := corechat.FindContact(peerID); err == nil {
-		if addr, err := net.ResolveTCPAddr("tcp", contact.Address()); err == nil {
-			return &transport.Peer{PeerID: peerID, Addr: addr}
-		}
-	}
-
-	s.stateMu.RLock()
-	neighbor, ok := s.neighbors[peerID]
-	s.stateMu.RUnlock()
-	if ok {
-		if addr, err := net.ResolveTCPAddr("tcp", neighbor.Addr); err == nil {
-			return &transport.Peer{PeerID: peerID, Addr: addr}
-		}
-	}
-	return nil
 }
 
-func (s *Service) sendJoin(peerID, peerAddr, chatID string) error {
-	peer := s.resolvePeer(peerID, peerAddr)
-	if peer == nil {
-		return fmt.Errorf("peer address not found: %s", peerID)
-	}
-	join := protocol.NewJoin(chatID, s.cfg.LocalID, peerID)
-	join.FromPub = s.identityPub
-	return s.sendProtocolMessage(peer, join)
-}
-
-func (s *Service) sendAck(msg protocol.Message, sender *net.TCPAddr) error {
-	peer := s.resolvePeer(msg.TargetID, "")
-	if peer == nil && sender != nil {
-		peer = &transport.Peer{PeerID: msg.TargetID, Addr: sender}
-	}
-	if peer == nil {
-		return fmt.Errorf("ack peer not found: %s", msg.TargetID)
-	}
-	return s.sendProtocolMessage(peer, msg)
-}
-
-func (s *Service) sendProtocolMessage(peer *transport.Peer, msg protocol.Message) error {
-	if err := protocol.ValidateMessage(msg); err != nil {
-		return err
-	}
-	wire, err := protocol.MarshalMessage(msg)
+func (s *Service) retryDueOutbox() {
+	items, err := history.LoadDueOutbox(time.Now().UnixMilli(), 16)
 	if err != nil {
-		return err
+		s.emitError(err)
+		return
 	}
-	return transport.SendTCP(peer, wire)
+	for _, item := range items {
+		msg := protocol.Message{
+			Version:   protocol.ProtocolVersion,
+			Type:      protocol.MsgChat,
+			Target:    protocol.TargetPeer,
+			TTL:       item.TTL,
+			TargetID:  item.TargetID,
+			ChatID:    item.ChatID,
+			From:      s.cfg.LocalID,
+			Payload:   item.Payload,
+			Timestamp: item.CreatedAt,
+		}
+		if err := msg.Sign(s.identity.PrivateKey); err != nil {
+			_ = history.UpdateOutboxFailure(item.MessageID, err.Error(), time.Now().Add(30*time.Second).UnixMilli())
+			continue
+		}
+		msg.ID = item.MessageID
+		strategy, err := s.routeMessage(msg)
+		if err != nil {
+			_ = history.UpdateOutboxFailure(item.MessageID, err.Error(), time.Now().Add(30*time.Second).UnixMilli())
+			continue
+		}
+		msg.Strategy = strategy
+		_ = history.SaveMessage(msg)
+		_ = history.DeleteOutbox(item.MessageID)
+	}
 }
 
-func (s *Service) forwardToNeighbors(msg protocol.Message, sender *net.TCPAddr) error {
+func (s *Service) bootstrapContactHints() error {
 	contacts, err := corechat.ListContacts()
 	if err != nil {
 		return err
 	}
-
-	targets := make(map[string]*transport.Peer)
-	add := func(peerID, addrStr string) {
-		if peerID == "" || peerID == msg.From || addrStr == "" {
-			return
-		}
-		if sender != nil && sender.String() == addrStr {
-			return
-		}
-		if _, ok := targets[addrStr]; ok {
-			return
-		}
-		addr, err := net.ResolveTCPAddr("tcp", addrStr)
-		if err != nil {
-			return
-		}
-		targets[addrStr] = &transport.Peer{PeerID: peerID, Addr: addr}
-	}
-
 	for _, item := range contacts {
-		add(item.PeerID, item.Address())
-	}
-
-	s.stateMu.RLock()
-	for _, item := range s.neighbors {
-		add(item.PeerID, item.Addr)
-	}
-	s.stateMu.RUnlock()
-
-	if len(targets) == 0 {
-		return fmt.Errorf("no neighbors or contacts to forward")
-	}
-	for _, peer := range targets {
-		go func(peer *transport.Peer) {
-			_ = s.sendProtocolMessage(peer, msg)
-		}(peer)
+		if item.Name != "" {
+			_ = history.UpsertPeerAlias(item.PeerID, item.Name)
+		}
+		if s.node != nil {
+			_ = s.node.RememberHint(item.PeerID, item.Address())
+		}
 	}
 	return nil
+}
+
+func bestAddr(info peer.AddrInfo) string {
+	for _, addr := range info.Addrs {
+		text := addr.String()
+		if strings.Contains(text, "/p2p-circuit") {
+			continue
+		}
+		return text
+	}
+	if len(info.Addrs) > 0 {
+		return info.Addrs[0].String()
+	}
+	return ""
 }
 
 func privateChatID(a, b string) string {
@@ -1081,29 +883,4 @@ func privateChatID(a, b string) string {
 	return "dm:" + b + ":" + a
 }
 
-func validatePeerID(peerID string) error {
-	if peerID == "" {
-		return fmt.Errorf("peer_id is required")
-	}
-	if len(peerID) < 3 || len(peerID) > 32 {
-		return fmt.Errorf("peer_id must be 3-32 characters long")
-	}
-	for _, ch := range peerID {
-		isLetter := ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z'
-		isDigit := ch >= '0' && ch <= '9'
-		switch {
-		case isLetter, isDigit, ch == '-', ch == '_', ch == '.':
-			continue
-		default:
-			return fmt.Errorf("peer_id may contain only letters, numbers, dot, dash and underscore")
-		}
-	}
-	return nil
-}
-
-func senderKey(sender *net.TCPAddr) string {
-	if sender == nil {
-		return "unknown"
-	}
-	return sender.IP.String()
-}
+var _ = errors.Is

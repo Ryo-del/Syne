@@ -40,6 +40,7 @@ export type UIMessage = {
   text: string;
   timestamp: number;
   direction: "incoming" | "outgoing";
+  strategy: string;
 };
 
 export type Snapshot = {
@@ -53,6 +54,12 @@ export type Snapshot = {
 
 export type Profile = {
   local_id: string;
+};
+
+export type InviteCode = {
+  code: string;
+  peer_id: string;
+  expires_at: number;
 };
 
 export type AppEvent = {

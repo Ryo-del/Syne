@@ -27,7 +27,7 @@ func TestSaveMessageDedupByMessageID(t *testing.T) {
 		Version:   protocol.ProtocolVersion,
 		Type:      protocol.MsgChat,
 		Target:    protocol.TargetPeer,
-		MessageID: "msg-1",
+		ID:        "msg-1",
 		TargetID:  "B",
 		ChatID:    "dm:A:B",
 		From:      "A",

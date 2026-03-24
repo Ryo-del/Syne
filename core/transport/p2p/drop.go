@@ -1,4 +1,4 @@
-package drop
+package p2p
 
 type StoredMessage struct {
 	Version   uint8  `json:"version"`

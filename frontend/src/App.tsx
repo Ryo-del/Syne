@@ -11,19 +11,21 @@ import {
   getApiBase,
   listenEvents,
   loadBootstrap,
+  loadInviteCode,
   loadMessages,
   markChatRead,
   openPrivateChat,
   renameContact,
+  resolveInviteCode,
   saveContact,
   sendMessage,
-  setPeerId,
   unblockPeer,
 } from "./lib/api";
 import type {
   AppEvent,
   ChatSummary,
   Contact,
+  InviteCode,
   Snapshot,
   UIMessage,
 } from "./types";
@@ -166,7 +168,6 @@ export default function App() {
   const [selectedChatId, setSelectedChatId] = useState("");
   const [messages, setMessages] = useState<Record<string, UIMessage[]>>({});
   const [query, setQuery] = useState("");
-  const [localPeerIdDraft, setLocalPeerIdDraft] = useState("");
   const [composer, setComposer] = useState("");
   const [error, setError] = useState("");
   const [errorToastKey, setErrorToastKey] = useState(0);
@@ -174,6 +175,8 @@ export default function App() {
   const [saving, setSaving] = useState(false);
   const [showNewContactPopover, setShowNewContactPopover] = useState(false);
   const [contactForm, setContactForm] = useState<Contact>(EMPTY_CONTACT);
+  const [inviteCode, setInviteCode] = useState<InviteCode | null>(null);
+  const [invitePeerIdDraft, setInvitePeerIdDraft] = useState("");
   const [blockReason, setBlockReason] = useState("");
   const [editingPeerName, setEditingPeerName] = useState(false);
   const [peerNameDraft, setPeerNameDraft] = useState("");
@@ -194,7 +197,6 @@ export default function App() {
   const selectedMessages = selectedChat ? messages[selectedChat.chat_id] ?? [] : [];
   const selectedAddr = selectedChat?.known_addr || selectedPeer?.addr || "";
   const selectedPeerEmoji = selectedChat ? peerEmojis[selectedChat.peer_id] ?? "🙂" : "🙂";
-  const showPeerIdOnboarding = !loading && !snapshot.local_id.trim();
 
   const filteredChats = useMemo(() => {
     const needle = deferredQuery.trim().toLowerCase();
@@ -381,24 +383,6 @@ export default function App() {
     }
   }
 
-  async function handleSubmitLocalPeerId() {
-    const peerId = localPeerIdDraft.trim();
-    if (!peerId) {
-      setError("Enter a Peer ID");
-      return;
-    }
-    try {
-      setSaving(true);
-      setError("");
-      await setPeerId(peerId);
-      await refreshBootstrap(false);
-    } catch (err) {
-      setError(describeError(err, "Failed to save Peer ID"));
-    } finally {
-      setSaving(false);
-    }
-  }
-
   async function handleSaveContact() {
     if (!contactForm.name || !contactForm.peer_id || !contactForm.ip || !contactForm.port) {
       setError("Fill all contact fields");
@@ -497,8 +481,35 @@ export default function App() {
     }
   }
 
-  function openManualContactPopover() {
+  async function handleOpenInvitePeer() {
+    const code = invitePeerIdDraft.trim();
+    if (!code) {
+      setError("Enter a 6-digit code");
+      return;
+    }
+    try {
+      setSaving(true);
+      setError("");
+      const { peer_id } = await resolveInviteCode(code);
+      await handleOpenPeer(peer_id);
+      setInvitePeerIdDraft("");
+      setShowNewContactPopover(false);
+    } catch (err) {
+      setError(describeError(err, "Failed to resolve invite code"));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function openManualContactPopover() {
     setContactForm(buildEmptyContact());
+    setInvitePeerIdDraft("");
+    try {
+      const invite = await loadInviteCode();
+      setInviteCode(invite);
+    } catch {
+      setInviteCode(null);
+    }
     setShowNewContactPopover(true);
   }
 
@@ -556,7 +567,7 @@ export default function App() {
 </div>
           <div className="profile-copy-block">
             <p className="eyebrow">You</p>
-            <h2>{snapshot.local_id || "Pending"}</h2>
+            <h2>{snapshot.local_id}</h2>
             <p>{snapshot.chats.length} chats · {snapshot.neighbors.length} nearby peers</p>
           </div>
         </section>
@@ -626,10 +637,30 @@ export default function App() {
           {showNewContactPopover ? (
             <div className="contact-popover">
               <div className="panel-head popover-head">
-                <h2>New contact</h2>
+                <h2>Add friend</h2>
                 <button type="button" className="ghost-tiny" onClick={() => setShowNewContactPopover(false)}>
                   Close
                 </button>
+              </div>
+              <div className="popover-form">
+                <label>
+                  <span>Your 6-digit code</span>
+                  <input value={inviteCode?.code ?? "Loading..."} readOnly />
+                </label>
+                <label>
+                  <span>Friend code</span>
+                  <input
+                    value={invitePeerIdDraft}
+                    placeholder="123456"
+                    onChange={(event) => setInvitePeerIdDraft(event.target.value.replace(/\D/g, "").slice(0, 6))}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter") {
+                        event.preventDefault();
+                        void handleOpenInvitePeer();
+                      }
+                    }}
+                  />
+                </label>
               </div>
               <div className="popover-form">
                 <label>
@@ -662,6 +693,9 @@ export default function App() {
                 </label>
               </div>
               <div className="action-row">
+                <button type="button" className="ghost" disabled={!invitePeerIdDraft || saving} onClick={() => void handleOpenInvitePeer()}>
+                  Open by code
+                </button>
                 <button type="button" className="ghost" disabled={!selectedChat} onClick={prefillFromCurrentPeer}>
                   Use current peer
                 </button>
@@ -708,7 +742,10 @@ export default function App() {
                   >
                     <header>
                       <strong>{message.direction === "outgoing" ? "You" : selectedChat.title || message.from}</strong>
-                      <time>{formatTime(message.timestamp)}</time>
+                      <div className="message-meta">
+                        <span className={`delivery-pill ${message.strategy}`}>{message.strategy}</span>
+                        <time>{formatTime(message.timestamp)}</time>
+                      </div>
                     </header>
                     <p>{message.text}</p>
                   </article>
@@ -873,31 +910,6 @@ export default function App() {
         >
           <span className="error-toast-title">Error</span>
           <p>{error}</p>
-        </div>
-      ) : null}
-
-      {showPeerIdOnboarding ? (
-        <div className="onboarding-overlay" role="dialog" aria-modal="true" aria-label="Set peer id">
-          <section className="onboarding-card">
-            <div className="onboarding-emoji" aria-hidden="true">🪪</div>
-            <p className="onboarding-copy">
-            Введите свой PeerID, чтобы другие устройства в сети могли распознать и открыть чат с вами.
-            </p>
-            <input
-              className="onboarding-input"
-              placeholder="Peer ID"
-              value={localPeerIdDraft}
-              autoFocus
-              disabled={saving}
-              onChange={(event) => setLocalPeerIdDraft(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter") {
-                  event.preventDefault();
-                  void handleSubmitLocalPeerId();
-                }
-              }}
-            />
-          </section>
         </div>
       ) : null}
     </>

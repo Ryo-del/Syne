@@ -3,6 +3,7 @@ import type {
   BlockedPeer,
   ChatSummary,
   Contact,
+  InviteCode,
   Profile,
   Snapshot,
   UIMessage,
@@ -94,6 +95,17 @@ export function sendMessage(payload: {
   return request<UIMessage>("/api/messages", {
     method: "POST",
     body: JSON.stringify(payload),
+  });
+}
+
+export function loadInviteCode() {
+  return request<InviteCode>("/api/invite");
+}
+
+export function resolveInviteCode(code: string) {
+  return request<{ peer_id: string }>("/api/invite/resolve", {
+    method: "POST",
+    body: JSON.stringify({ code }),
   });
 }
 
