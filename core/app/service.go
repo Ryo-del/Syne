@@ -515,12 +515,9 @@ func (s *Service) routeMessage(msg protocol.Message) (protocol.Strategy, error) 
 		return strategy, nil
 	}
 
-	select {
-	case hopResult := <-hopCh:
-		if hopResult.err == nil {
-			return hopResult.strategy, nil
-		}
-	default:
+	hopResult := <-hopCh
+	if hopResult.err == nil {
+		return hopResult.strategy, nil
 	}
 
 	msg.Strategy = protocol.StrategyOffline

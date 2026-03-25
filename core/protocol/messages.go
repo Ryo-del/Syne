@@ -65,8 +65,6 @@ type unsignedMessage struct {
 	Type       MessageType `json:"type"`
 	Target     TargetType  `json:"target"`
 	ID         string      `json:"id"`
-	Strategy   Strategy    `json:"strategy"`
-	TTL        int         `json:"ttl,omitempty"`
 	TargetID   string      `json:"target_id"`
 	ChatID     string      `json:"chat_id"`
 	From       string      `json:"from"`
@@ -277,8 +275,6 @@ func (m Message) unsignedPayload(includeID bool) ([]byte, error) {
 		Version:    m.Version,
 		Type:       m.Type,
 		Target:     m.Target,
-		Strategy:   m.Strategy,
-		TTL:        m.TTL,
 		TargetID:   strings.TrimSpace(m.TargetID),
 		ChatID:     strings.TrimSpace(m.ChatID),
 		From:       strings.TrimSpace(m.From),
