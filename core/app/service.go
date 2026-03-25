@@ -285,6 +285,7 @@ func (s *Service) OpenPrivateChat(peerID, peerAddr, name string) (ChatSummary, e
 }
 
 func (s *Service) SendMessage(chatID, targetID, text string) (UIMessage, error) {
+	fmt.Printf("[SYNE-DEBUG] SendMessage called: chatID=%s targetID=%s text=%q\n", chatID, targetID, text)
 	chatID = strings.TrimSpace(chatID)
 	targetID = strings.TrimSpace(targetID)
 	text = strings.TrimSpace(text)
@@ -310,13 +311,17 @@ func (s *Service) SendMessage(chatID, targetID, text string) (UIMessage, error) 
 		Timestamp: time.Now().UnixMilli(),
 	}
 	if err := msg.Sign(s.identity.PrivateKey); err != nil {
+		fmt.Printf("[SYNE-DEBUG] Sign error: %v\n", err)
 		return UIMessage{}, err
 	}
+	fmt.Printf("[SYNE-DEBUG] Message signed, ID=%s. Routing...\n", msg.ID)
 
 	strategy, err := s.routeMessage(msg)
 	if err != nil {
+		fmt.Printf("[SYNE-DEBUG] routeMessage error: %v\n", err)
 		return UIMessage{}, err
 	}
+	fmt.Printf("[SYNE-DEBUG] routeMessage success, strategy=%s\n", strategy.String())
 	msg.Strategy = strategy
 
 	if err := history.SaveMessage(msg); err != nil {
@@ -493,6 +498,7 @@ func (s *Service) ResolveInviteCode(code string) (string, error) {
 }
 
 func (s *Service) routeMessage(msg protocol.Message) (protocol.Strategy, error) {
+	fmt.Printf("[SYNE-DEBUG] routeMessage: target=%s\n", msg.TargetID)
 	type result struct {
 		strategy protocol.Strategy
 		err      error
@@ -502,23 +508,34 @@ func (s *Service) routeMessage(msg protocol.Message) (protocol.Strategy, error) 
 	go func() {
 		hopCtx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
 		defer cancel()
-		hopCh <- result{strategy: protocol.StrategyHop, err: s.node.SendHop(hopCtx, msg, "")}
+		err := s.node.SendHop(hopCtx, msg, "")
+		fmt.Printf("[SYNE-DEBUG] SendHop result: err=%v\n", err)
+		hopCh <- result{strategy: protocol.StrategyHop, err: err}
 	}()
 
 	directCtx, cancel := context.WithTimeout(s.ctx, relayFallbackTimeout)
 	defer cancel()
 	if strategy, err := s.node.SendDirect(directCtx, msg, false); err == nil {
+		fmt.Printf("[SYNE-DEBUG] SendDirect (no relay) succeeded: strategy=%s\n", strategy.String())
 		return strategy, nil
+	} else {
+		fmt.Printf("[SYNE-DEBUG] SendDirect (no relay) failed: %v\n", err)
 	}
 
 	if strategy, err := s.node.SendDirect(s.ctx, msg, true); err == nil {
+		fmt.Printf("[SYNE-DEBUG] SendDirect (relay) succeeded: strategy=%s\n", strategy.String())
 		return strategy, nil
+	} else {
+		fmt.Printf("[SYNE-DEBUG] SendDirect (relay) failed: %v\n", err)
 	}
 
+	fmt.Printf("[SYNE-DEBUG] Waiting for hop result...\n")
 	hopResult := <-hopCh
 	if hopResult.err == nil {
+		fmt.Printf("[SYNE-DEBUG] Hop succeeded!\n")
 		return hopResult.strategy, nil
 	}
+	fmt.Printf("[SYNE-DEBUG] Hop failed: %v. Queuing offline.\n", hopResult.err)
 
 	msg.Strategy = protocol.StrategyOffline
 	if err := history.QueueMessage(msg, time.Now().Add(10*time.Second).UnixMilli()); err != nil {

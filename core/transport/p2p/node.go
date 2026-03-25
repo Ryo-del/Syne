@@ -226,7 +226,7 @@ func (n *Node) PublishInvite(code string, ttl time.Duration) (inviteRecord, erro
 	ctx, cancel := context.WithTimeout(n.ctx, 8*time.Second)
 	defer cancel()
 	if err := n.dht.PutValue(ctx, inviteDHTKey(code), raw); err != nil {
-		return inviteRecord{}, err
+		fmt.Printf("DHT PutValue for invite %s failed (network may be empty): %v\n", code, err)
 	}
 	n.mu.Lock()
 	n.invites[code] = rec
