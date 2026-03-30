@@ -49,6 +49,7 @@ func DeleteContact(query string) error {
 		return fmt.Errorf("contact not found: %s", query)
 	}
 	contacts = append(contacts[:foundIndex], contacts[foundIndex+1:]...)
+
 	return writeContacts(contacts)
 }
 

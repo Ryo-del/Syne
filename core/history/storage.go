@@ -184,9 +184,18 @@ func DeleteOutbox(messageID string) error {
 		return err
 	}
 	_, err = database.Exec(`DELETE FROM outbox WHERE message_id = ?`, messageID)
+
 	return err
 }
 
+func DeletePeerAlias(peerID string) error {
+	database, err := getDB()
+	if err != nil {
+		return err
+	}
+	_, err = database.Exec(`DELETE FROM peer_aliases WHERE peer_id = ?`, peerID)
+	return err
+}
 func ensureDB() error {
 	_, err := getDB()
 	return err

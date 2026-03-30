@@ -22,6 +22,14 @@ import {
   sendMessage,
   unblockPeer,
 } from "./lib/api";
+import { Image as TauriImage } from "@tauri-apps/api/image";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import blackIcon from "../src-tauri/icons/black.jpeg";
+import blueIcon from "../src-tauri/icons/blue.jpeg";
+import greenIcon from "../src-tauri/icons/green.jpeg";
+import orangeIcon from "../src-tauri/icons/orange.jpeg";
+import redIcon from "../src-tauri/icons/red.jpeg";
+import skyIcon from "../src-tauri/icons/sky.jpeg";
 import type {
   AppEvent,
   ChatSummary,
@@ -48,7 +56,32 @@ const EMPTY_SNAPSHOT: Snapshot = {
 };
 
 const EMOJI_OPTIONS = ["🙂", "😎", "🤝", "🛰️", "🌿", "🔥", "🦊", "🐼", "😇", "🌙"];
-type SidebarView = "chats" | "network" | "blocked";
+type SidebarView = "chats" | "contacts" | "network" | "blocked";
+type ThemePreference = "system" | "light" | "dark";
+const SETTINGS_SECTIONS = [
+  { id: "notifications", label: "🔔 Notifications" },
+  { id: "language", label: "🌐 Language" },
+  { id: "appearance", label: "🎨 Appearance" },
+  { id: "delete-history", label: "🗑️ Delete chat history" },
+  { id: "sync-devices", label: "📱 Sync devices" },
+  { id: "device-key", label: "🔐 Device key" },
+  { id: "system-settings", label: "⚙️ System settings" },
+] as const;
+type SettingsSectionId = (typeof SETTINGS_SECTIONS)[number]["id"];
+const THEME_OPTIONS: Array<{ id: ThemePreference; label: string }> = [
+  { id: "light", label: "Light" },
+  { id: "dark", label: "Dark" },
+  { id: "system", label: "System" },
+];
+const APP_ICON_OPTIONS = [
+  { id: "blue", label: "Blue", src: blueIcon },
+  { id: "green", label: "Green", src: greenIcon },
+  { id: "orange", label: "Orange", src: orangeIcon },
+  { id: "red", label: "Red", src: redIcon },
+  { id: "sky", label: "Sky", src: skyIcon },
+  { id: "black", label: "Black", src: blackIcon },
+] as const;
+type AppIconId = (typeof APP_ICON_OPTIONS)[number]["id"];
 
 function formatTime(value: number) {
   if (!value) {
@@ -86,6 +119,53 @@ function splitAddress(addr?: string) {
     ip: addr.slice(0, index).replace(/^\[|\]$/g, ""),
     port: addr.slice(index + 1),
   };
+}
+
+function joinAddress(ip?: string, port?: string) {
+  const cleanIP = (ip ?? "").trim();
+  const cleanPort = (port ?? "").trim();
+  if (!cleanIP) {
+    return "";
+  }
+  if (!cleanPort) {
+    return cleanIP;
+  }
+  if (cleanIP.includes(":") && !cleanIP.startsWith("[") && !cleanIP.endsWith("]")) {
+    return `[${cleanIP}]:${cleanPort}`;
+  }
+  return `${cleanIP}:${cleanPort}`;
+}
+
+async function buildWindowIcon(src: string) {
+  if (typeof window === "undefined" || typeof document === "undefined") {
+    return null;
+  }
+
+  const image = await new Promise<HTMLImageElement>((resolve, reject) => {
+    const nextImage = new Image();
+    nextImage.onload = () => resolve(nextImage);
+    nextImage.onerror = () => reject(new Error(`Failed to load icon: ${src}`));
+    nextImage.src = src;
+  });
+
+  const width = image.naturalWidth || image.width;
+  const height = image.naturalHeight || image.height;
+  if (!width || !height) {
+    throw new Error("Selected icon has invalid dimensions");
+  }
+
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+
+  const ctx = canvas.getContext("2d");
+  if (!ctx) {
+    throw new Error("Canvas 2D context is unavailable");
+  }
+
+  ctx.drawImage(image, 0, 0, width, height);
+  const rgba = new Uint8Array(ctx.getImageData(0, 0, width, height).data);
+  return TauriImage.new(rgba, width, height);
 }
 
 function buildEmptyContact(overrides?: Partial<Contact>): Contact {
@@ -197,6 +277,11 @@ export default function App() {
     x: number;
     y: number;
   } | null>(null);
+  const [contactContextMenu, setContactContextMenu] = useState<{
+    peerId: string;
+    x: number;
+    y: number;
+  } | null>(null);
   const [query, setQuery] = useState("");
   const [composer, setComposer] = useState("");
   const [error, setError] = useState("");
@@ -212,6 +297,23 @@ export default function App() {
   const [peerNameDraft, setPeerNameDraft] = useState("");
   const [showDetailPanel, setShowDetailPanel] = useState(false);
   const [sidebarView, setSidebarView] = useState<SidebarView>("chats");
+  const [showSettings, setShowSettings] = useState(false);
+  const [activeSettingsSection, setActiveSettingsSection] = useState<SettingsSectionId | null>(null);
+  const [themePreference, setThemePreference] = useState<ThemePreference>(() =>
+    readStorage("syne.theme_preference", "system"),
+  );
+  const [selectedAppIcon, setSelectedAppIcon] = useState<AppIconId>(() => {
+    const stored = readStorage<string>("syne.app_icon", "blue");
+    return APP_ICON_OPTIONS.some((item) => item.id === stored)
+      ? stored as AppIconId
+      : "blue";
+  });
+  const [systemTheme, setSystemTheme] = useState<"light" | "dark">(() => {
+    if (typeof window === "undefined") {
+      return "dark";
+    }
+    return window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+  });
   const [emojiPickerTarget, setEmojiPickerTarget] = useState<"self" | "peer" | null>(null);
   const [selfEmoji, setSelfEmoji] = useState(() => readStorage("syne.self_emoji", "🙂"));
   const [peerEmojis, setPeerEmojis] = useState<Record<string, string>>(() =>
@@ -237,6 +339,11 @@ export default function App() {
   const selectedPeerEmoji = selectedChat
     ? peerEmojis[selectedChat.peer_id] ?? getInitial(selectedChat.title || selectedChat.peer_id)
     : "🙂";
+  const activeSettingsItem = activeSettingsSection
+    ? SETTINGS_SECTIONS.find((item) => item.id === activeSettingsSection) ?? null
+    : null;
+  const resolvedTheme = themePreference === "system" ? systemTheme : themePreference;
+  const currentAppIcon = APP_ICON_OPTIONS.find((item) => item.id === selectedAppIcon) ?? APP_ICON_OPTIONS[0];
 
   const filteredChats = useMemo(() => {
     const needle = deferredQuery.trim().toLowerCase();
@@ -261,6 +368,19 @@ export default function App() {
     ));
   }, [deferredQuery, snapshot.neighbors]);
 
+  const filteredContacts = useMemo(() => {
+    const needle = deferredQuery.trim().toLowerCase();
+    if (!needle) {
+      return snapshot.contacts;
+    }
+    return snapshot.contacts.filter((item) => (
+      item.name.toLowerCase().includes(needle) ||
+      item.peer_id.toLowerCase().includes(needle) ||
+      item.ip.toLowerCase().includes(needle) ||
+      item.port.toLowerCase().includes(needle)
+    ));
+  }, [deferredQuery, snapshot.contacts]);
+
   const filteredBlockedPeers = useMemo(() => {
     const needle = deferredQuery.trim().toLowerCase();
     if (!needle) {
@@ -275,18 +395,24 @@ export default function App() {
 
   const sidebarTitle = sidebarView === "chats"
     ? "Chats"
+    : sidebarView === "contacts"
+      ? "Contacts"
     : sidebarView === "network"
       ? "Nearby"
       : "Black list";
 
   const sidebarBadge = sidebarView === "chats"
     ? `${filteredChats.length}`
+    : sidebarView === "contacts"
+      ? `${filteredContacts.length}`
     : sidebarView === "network"
       ? `${filteredNearbyPeers.length}`
       : `${filteredBlockedPeers.length}`;
 
   const searchPlaceholder = sidebarView === "chats"
     ? "Search chats..."
+    : sidebarView === "contacts"
+      ? "Search contacts..."
     : sidebarView === "network"
       ? "Search nearby peers..."
       : "Search blocked peers...";
@@ -349,6 +475,7 @@ export default function App() {
 
     const handlePointerDown = () => {
       setChatContextMenu(null);
+      setContactContextMenu(null);
     };
 
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -497,6 +624,80 @@ export default function App() {
   }, [error]);
 
   useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    const media = window.matchMedia("(prefers-color-scheme: light)");
+    const handleChange = (event: MediaQueryListEvent) => {
+      setSystemTheme(event.matches ? "light" : "dark");
+    };
+
+    setSystemTheme(media.matches ? "light" : "dark");
+    if (typeof media.addEventListener === "function") {
+      media.addEventListener("change", handleChange);
+      return () => media.removeEventListener("change", handleChange);
+    }
+    media.addListener(handleChange);
+    return () => media.removeListener(handleChange);
+  }, []);
+
+  useEffect(() => {
+    writeStorage("syne.theme_preference", themePreference);
+  }, [themePreference]);
+
+  useEffect(() => {
+    writeStorage("syne.app_icon", selectedAppIcon);
+  }, [selectedAppIcon]);
+
+  useEffect(() => {
+    if (typeof document === "undefined") {
+      return;
+    }
+    document.documentElement.dataset.theme = resolvedTheme;
+    document.documentElement.style.colorScheme = resolvedTheme;
+    const themeMeta = document.querySelector('meta[name="theme-color"]');
+    themeMeta?.setAttribute("content", resolvedTheme === "light" ? "#f3ebdd" : "#0e1117");
+  }, [resolvedTheme]);
+
+  useEffect(() => {
+    if (typeof document === "undefined") {
+      return;
+    }
+    let iconLink = document.querySelector("link[rel='icon']") as HTMLLinkElement | null;
+    if (!iconLink) {
+      iconLink = document.createElement("link");
+      iconLink.rel = "icon";
+      document.head.appendChild(iconLink);
+    }
+    iconLink.href = currentAppIcon.src;
+  }, [currentAppIcon.src]);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !("__TAURI_INTERNALS__" in window)) {
+      return;
+    }
+
+    let cancelled = false;
+
+    async function applyWindowIcon() {
+      try {
+        const icon = await buildWindowIcon(currentAppIcon.src);
+        if (!icon || cancelled) {
+          return;
+        }
+        await getCurrentWindow().setIcon(icon);
+      } catch {
+        return;
+      }
+    }
+
+    void applyWindowIcon();
+    return () => {
+      cancelled = true;
+    };
+  }, [currentAppIcon.src]);
+
+  useEffect(() => {
     if (!selectedChat) {
       setPeerNameDraft("");
       setEditingPeerName(false);
@@ -522,7 +723,12 @@ export default function App() {
         }));
         setSelectedChatId(chat.chat_id);
       });
-      await refreshMessages(chat.chat_id);
+      setSidebarView("chats");
+      try {
+        await refreshMessages(chat.chat_id);
+      } catch (err) {
+        setError(describeError(err, "Failed to load chat history"));
+      }
     } catch (err) {
       setError(describeError(err, "Failed to open chat"));
     }
@@ -598,12 +804,14 @@ export default function App() {
     }
   }
 
-  async function handleDeleteContact() {
-    if (!selectedChat) return;
+  async function handleDeleteContact(peerId?: string) {
+    const targetPeerId = peerId ?? selectedChat?.peer_id;
+    if (!targetPeerId) return;
     try {
       setSaving(true);
       setError("");
-      await deleteContact(selectedChat.peer_id);
+      await deleteContact(targetPeerId);
+      setContactContextMenu(null);
       await refreshBootstrap();
     } catch (err) {
       setError(describeError(err, "Failed to delete contact"));
@@ -661,6 +869,15 @@ export default function App() {
     } finally {
       setSaving(false);
     }
+  }
+  function handleSettings() {
+    setActiveSettingsSection(null);
+    setShowSettings(true);
+  }
+
+  function closeSettings() {
+    setShowSettings(false);
+    setActiveSettingsSection(null);
   }
 
   async function openManualContactPopover() {
@@ -723,6 +940,18 @@ export default function App() {
       x: event.clientX,
       y: event.clientY,
     });
+    setContactContextMenu(null);
+  }
+
+  function handleContactContextMenu(event: React.MouseEvent, peerId: string) {
+    event.preventDefault();
+    event.stopPropagation();
+    setContactContextMenu({
+      peerId,
+      x: event.clientX,
+      y: event.clientY,
+    });
+    setChatContextMenu(null);
   }
 
   // First message date for session separator
@@ -762,7 +991,7 @@ export default function App() {
             title="Chats"
             onClick={() => setSidebarView("chats")}
           >
-            <svg viewBox="0 0 24 24"><path d="M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm0 14H6l-2 2V4h16v12z" /></svg>
+            <svg viewBox="0 0 24 24" fill="currentColor"><path d="M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm0 14H6l-2 2V4h16v12z" /></svg>
           </button>
 
           {/* Network icon */}
@@ -774,7 +1003,15 @@ export default function App() {
           >
             <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m10.586 5.414-5.172 5.172" /><path d="m18.586 13.414-5.172 5.172" /><path d="M6 12h12" /><circle cx="12" cy="20" r="2" /><circle cx="12" cy="4" r="2" /><circle cx="20" cy="12" r="2" /><circle cx="4" cy="12" r="2" /></svg>
           </button>
-
+          {/*Contacts icon */}
+          <button
+            type="button"
+            className={`icon-rail-btn ${sidebarView === "contacts" ? "active" : ""}`}
+            title="Contacts"
+            onClick={() => setSidebarView("contacts")}
+          >
+            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M16 2v2" /><path d="M7 22v-2a2 2 0 0 1 2-2h6a2 2 0 0 1 2 2v2" /><path d="M8 2v2" /><circle cx="12" cy="11" r="3" /><rect x="3" y="4" width="18" height="18" rx="2" /></svg>
+          </button>
           {/* Black list icon */}
           <button
             type="button"
@@ -784,8 +1021,18 @@ export default function App() {
           >
             <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10" /><path d="M4.929 4.929 19.07 19.071" /></svg>
           </button>
+
           <div className="icon-rail-spacer" />
-          <div className="icon-rail-dot" />
+          {/*Settings icon */}
+          <button
+            type="button"
+            className={`icon-rail-btn ${showSettings ? "active" : ""}`}
+            title="Settings"
+            onClick={handleSettings}
+          >
+            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="lucide lucide-settings-icon lucide-settings"><path d="M9.671 4.136a2.34 2.34 0 0 1 4.659 0 2.34 2.34 0 0 0 3.319 1.915 2.34 2.34 0 0 1 2.33 4.033 2.34 2.34 0 0 0 0 3.831 2.34 2.34 0 0 1-2.33 4.033 2.34 2.34 0 0 0-3.319 1.915 2.34 2.34 0 0 1-4.659 0 2.34 2.34 0 0 0-3.32-1.915 2.34 2.34 0 0 1-2.33-4.033 2.34 2.34 0 0 0 0-3.831A2.34 2.34 0 0 1 6.35 6.051a2.34 2.34 0 0 0 3.319-1.915" /><circle cx="12" cy="12" r="3" /></svg>
+          </button>
+
         </nav>
 
         {/* ─── Peers Panel ─── */}
@@ -879,6 +1126,43 @@ export default function App() {
               </>
             ) : null}
 
+            {sidebarView === "contacts" ? (
+              <>
+                {filteredContacts.map((contact) => (
+                  <div key={contact.peer_id} className="chat-list-row">
+                    <button
+                      className="peer-card"
+                      onContextMenu={(event) => handleContactContextMenu(event, contact.peer_id)}
+                      onClick={() => {
+                        setContactContextMenu(null);
+                        void handleOpenPeer(
+                          contact.peer_id,
+                          joinAddress(contact.ip, contact.port),
+                          contact.name || contact.peer_id,
+                        );
+                      }}
+                    >
+                      <div className="peer-card-avatar">
+                        {getPeerAvatar(contact.peer_id, contact.name || contact.peer_id)}
+                      </div>
+                      <div className="peer-card-info">
+                        <div className="peer-card-info-top">
+                          <strong>{contact.name || contact.peer_id}</strong>
+                        </div>
+                        <div className="peer-card-info-bottom">
+                          <span>{contact.ip}:{contact.port}</span>
+                          <span className="live-tag">saved</span>
+                        </div>
+                      </div>
+                    </button>
+                  </div>
+                ))}
+                {!filteredContacts.length ? (
+                  <div className="empty-state compact">No contacts yet.</div>
+                ) : null}
+              </>
+            ) : null}
+
             {sidebarView === "blocked" ? (
               <>
                 <div className="sidebar-blocked-list">
@@ -901,7 +1185,7 @@ export default function App() {
             ) : null}
           </div>
 
-          {sidebarView === "chats" ? (
+          {sidebarView === "chats" || sidebarView === "contacts" ? (
             <div className="peers-panel-footer">
               <button type="button" className="new-contact-button" onClick={openManualContactPopover}>
                 + New contact
@@ -1051,9 +1335,8 @@ export default function App() {
                   >
                     {selectedPeerEmoji}
                     <div
-                      className={`status-indicator ${
-                        selectedChat.blocked ? "blocked" : selectedChat.online ? "online" : ""
-                      }`}
+                      className={`status-indicator ${selectedChat.blocked ? "blocked" : selectedChat.online ? "online" : ""
+                        }`}
                     />
                   </button>
                   {emojiPickerTarget === "peer" ? (
@@ -1131,7 +1414,101 @@ export default function App() {
           ) : null}
         </div>
       </div>
+      {/* ─── Settings Popover (modal) ─── */}
+      {showSettings ? (
+        <>
+          <div className="contact-popover-backdrop" onClick={closeSettings} />
+          <div className="settings-popover" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+            <div className="settings-popover-head">
+              <div className="settings-popover-title">
+                {activeSettingsItem ? (
+                  <button
+                    type="button"
+                    className="ghost-tiny"
+                    onClick={() => setActiveSettingsSection(null)}
+                  >
+                    Back
+                  </button>
+                ) : (
+                  <span className="settings-popover-kicker">Preferences</span>
+                )}
+                <h2 id="settings-title">{activeSettingsItem?.label ?? "Settings"}</h2>
+              </div>
+              <button type="button" className="ghost-tiny" onClick={closeSettings}>
+                Close
+              </button>
+            </div>
 
+            {activeSettingsItem ? (
+              activeSettingsSection === "appearance" ? (
+                <div className="appearance-panel">
+                  <section className="appearance-section">
+                    <div className="appearance-section-head">
+                      <span className="appearance-section-label">Theme</span>
+                      <span className="appearance-section-meta">{resolvedTheme}</span>
+                    </div>
+                    <div className="appearance-theme-grid">
+                      {THEME_OPTIONS.map((theme) => (
+                        <button
+                          key={theme.id}
+                          type="button"
+                          className={`appearance-choice ${themePreference === theme.id ? "active" : ""}`}
+                          onClick={() => setThemePreference(theme.id)}
+                        >
+                          {theme.label}
+                        </button>
+                      ))}
+                    </div>
+                  </section>
+
+                  <section className="appearance-section">
+                    <div className="appearance-section-head">
+                      <span className="appearance-section-label">Icon</span>
+                      <span className="appearance-section-meta">{currentAppIcon.label}</span>
+                    </div>
+                    <div className="appearance-icon-current">
+                      <img src={currentAppIcon.src} alt={currentAppIcon.label} className="appearance-icon-current-image" />
+                      <div className="appearance-icon-current-copy">
+                        <strong>{currentAppIcon.label}</strong>
+                        <span>Saved locally for this device</span>
+                      </div>
+                    </div>
+                    <div className="appearance-icon-grid">
+                      {APP_ICON_OPTIONS.map((icon) => (
+                        <button
+                          key={icon.id}
+                          type="button"
+                          className={`appearance-icon-card ${selectedAppIcon === icon.id ? "active" : ""}`}
+                          onClick={() => setSelectedAppIcon(icon.id)}
+                        >
+                          <img src={icon.src} alt={icon.label} className="appearance-icon-image" />
+                          <span>{icon.label}</span>
+                        </button>
+                      ))}
+                    </div>
+                  </section>
+                </div>
+              ) : (
+                <div className="settings-panel-empty" />
+              )
+            ) : (
+              <div className="settings-menu">
+                {SETTINGS_SECTIONS.map((section) => (
+                  <button
+                    key={section.id}
+                    type="button"
+                    className="settings-menu-item"
+                    onClick={() => setActiveSettingsSection(section.id)}
+                  >
+                    <span>{section.label}</span>
+                    <span className="settings-menu-arrow" aria-hidden="true">›</span>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        </>
+      ) : null}
       {/* ─── Contact Popover (modal) ─── */}
       {showNewContactPopover ? (
         <>
@@ -1236,6 +1613,25 @@ export default function App() {
             onClick={() => handleHideChat(chatContextMenu.chatId)}
           >
             Удалить чат 🗑️
+          </button>
+        </div>
+      ) : null}
+
+      {contactContextMenu ? (
+        <div
+          className="chat-context-menu"
+          style={{
+            top: Math.max(16, contactContextMenu.y),
+            left: Math.max(16, contactContextMenu.x),
+          }}
+          onPointerDown={(event) => event.stopPropagation()}
+        >
+          <button
+            type="button"
+            className="chat-context-menu-item danger"
+            onClick={() => void handleDeleteContact(contactContextMenu.peerId)}
+          >
+            Удалить контакт 🗑️
           </button>
         </div>
       ) : null}

@@ -24,32 +24,71 @@ function buildUrl(path: string) {
   }
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(buildUrl(path), {
-    headers: {
-      "Content-Type": "application/json",
-      ...(init?.headers ?? {}),
-    },
-    ...init,
-  });
+function delay(ms: number) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
 
-  if (!response.ok) {
-    const fallback = `Request failed: ${response.status}`;
+function isTransientNetworkError(err: unknown) {
+  if (!(err instanceof Error)) {
+    return false;
+  }
+  const text = err.message.toLowerCase();
+  return (
+    text.includes("load failed") ||
+    text.includes("fetch failed") ||
+    text.includes("failed to fetch") ||
+    text.includes("networkerror") ||
+    text.includes("network error")
+  );
+}
+
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const url = buildUrl(path);
+  let lastError: unknown;
+
+  for (let attempt = 0; attempt < 8; attempt += 1) {
     try {
-      const body = (await response.json()) as { error?: string };
-      throw new Error(body.error ?? fallback);
-    } catch (error) {
-      if (error instanceof Error) {
-        throw error;
+      const response = await fetch(url, {
+        headers: {
+          "Content-Type": "application/json",
+          ...(init?.headers ?? {}),
+        },
+        ...init,
+      });
+
+      if (!response.ok) {
+        const fallback = `Request failed: ${response.status}`;
+        try {
+          const body = (await response.json()) as { error?: string };
+          throw new Error(body.error ?? fallback);
+        } catch (error) {
+          if (error instanceof Error) {
+            throw error;
+          }
+          throw new Error(fallback);
+        }
       }
-      throw new Error(fallback);
+
+      if (response.status === 204) {
+        return undefined as T;
+      }
+      return (await response.json()) as T;
+    } catch (err) {
+      lastError = err;
+      if (attempt === 7 || !isTransientNetworkError(err)) {
+        break;
+      }
+      await delay(250 * (attempt + 1));
     }
   }
 
-  if (response.status === 204) {
-    return undefined as T;
+  if (lastError instanceof Error) {
+    if (isTransientNetworkError(lastError)) {
+      throw new Error("Local backend is unavailable. Wait a moment and try again.");
+    }
+    throw lastError;
   }
-  return (await response.json()) as T;
+  throw new Error("Local backend is unavailable. Wait a moment and try again.");
 }
 
 export function loadBootstrap() {

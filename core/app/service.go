@@ -427,13 +427,60 @@ func (s *Service) RenameContact(query, newName string) (corechat.Contact, error)
 }
 
 func (s *Service) DeleteContact(query string) error {
-	if err := corechat.DeleteContact(query); err != nil {
+	contact, err := corechat.FindContact(query)
+	if err != nil {
 		return err
 	}
+	peerID := contact.PeerID
+
+	if err := corechat.DeleteContact(peerID); err != nil {
+		return err
+	}
+	if err := history.DeletePeerAlias(peerID); err != nil {
+		return err
+	}
+
+	chatID := privateChatID(s.cfg.LocalID, peerID)
+	chatExists := false
+
+	chats, err := s.listChats()
+	if err != nil {
+		return err
+	}
+	for _, item := range chats {
+		if item.ChatID == chatID {
+			chatExists = true
+			break
+		}
+	}
+
+	if chatExists {
+		if err := history.TouchChat(history.ChatRecord{
+			ChatID: chatID,
+			PeerID: peerID,
+			Title:  peerID,
+		}); err != nil {
+			return err
+		}
+	}
+
 	s.emit(Event{
 		Type:      "contact_deleted",
 		Timestamp: time.Now().UnixMilli(),
 	})
+
+	if chatExists {
+		summary, err := s.chatSummaryByID(chatID)
+		if err != nil {
+			return err
+		}
+		s.emit(Event{
+			Type:      "chat_updated",
+			Timestamp: time.Now().UnixMilli(),
+			Chat:      &summary,
+		})
+	}
+
 	return nil
 }
 

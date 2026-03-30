@@ -403,7 +403,8 @@ func (s *server) handleBlocked(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		item, err := s.service.BlockPeer(req.Query, req.Reason)
+		svc := s.service
+		item, err := svc.BlockPeer(req.Query, req.Reason)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
