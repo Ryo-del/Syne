@@ -6,7 +6,10 @@ use std::{
 };
 
 use tauri::{AppHandle, Manager};
-use tauri_plugin_shell::{process::CommandChild, ShellExt};
+use tauri_plugin_shell::{
+  process::{CommandChild, CommandEvent},
+  ShellExt,
+};
 
 const API_ADDR: &str = "127.0.0.1:38673";
 
@@ -54,9 +57,20 @@ fn spawn_backend(app: &AppHandle) -> Result<CommandChild, String> {
         .to_str()
         .ok_or_else(|| "workdir contains invalid UTF-8".to_string())?,
     ]);
-  let (_rx, child) = command
+  let (mut rx, child) = command
     .spawn()
     .map_err(|err| format!("failed to start sidecar: {err}"))?;
+  tauri::async_runtime::spawn(async move {
+    while let Some(event) = rx.recv().await {
+      match event {
+        CommandEvent::Error(err) => eprintln!("syne-ui-api sidecar error: {err}"),
+        CommandEvent::Terminated(payload) => {
+          eprintln!("syne-ui-api sidecar terminated: {:?}", payload.code)
+        }
+        _ => {}
+      }
+    }
+  });
   Ok(child)
 }
 

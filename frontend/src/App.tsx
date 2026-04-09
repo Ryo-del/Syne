@@ -686,8 +686,8 @@ export default function App() {
           return;
         }
         await getCurrentWindow().setIcon(icon);
-      } catch {
-        return;
+      } catch (err) {
+        console.warn("Failed to apply runtime window icon", err);
       }
     }
 
@@ -964,6 +964,22 @@ export default function App() {
       <div className="app-shell">
         {/* ─── Icon Rail ─── */}
         <nav className="icon-rail">
+          <button
+            type="button"
+            className="icon-rail-brand"
+            onClick={() => {
+              setShowSettings(true);
+              setActiveSettingsSection("appearance");
+            }}
+            title="Appearance"
+          >
+            <img
+              src={currentAppIcon.src}
+              alt={`${currentAppIcon.label} app icon`}
+              className="icon-rail-brand-image"
+            />
+          </button>
+
           <div className="emoji-anchor">
             <button
               type="button"

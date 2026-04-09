@@ -90,7 +90,6 @@ func main() {
 	}()
 
 	log.Printf("syne ui api listening on http://%s", addr)
-	fmt.Println("!!! API SERVER STARTED ON 0.0.0.0:38673 !!!")
 	if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("http server: %v", err)
 	}
